@@ -2,3 +2,4 @@ node_modules
 .vite/
 data/*.db
 backups/*.sql
+smartdocs-php/config/database.local.php

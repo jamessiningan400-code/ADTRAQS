@@ -43,13 +43,18 @@ if (typeof window !== "undefined") {
   const originalFetch = window.fetch.bind(window);
   window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
     if (typeof input === "string" && input.startsWith("/api") && API_BASE) {
-      return originalFetch(`${API_BASE}${input}`, init);
+      return originalFetch(buildApiUrl(input), init);
     }
 
     if (input instanceof URL && input.pathname.startsWith("/api") && API_BASE) {
       const nextUrl = new URL(input.toString());
-      const apiOrigin = new URL(API_BASE).origin;
-      return originalFetch(new URL(`${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`, apiOrigin), init);
+      const apiBase = new URL(API_BASE, window.location.origin);
+      const apiBasePath = `${apiBase.pathname.replace(/\/+$/, "")}/`;
+      const requestPath = nextUrl.pathname.replace(/^\/+/, "");
+      return originalFetch(
+        new URL(`${requestPath}${nextUrl.search}${nextUrl.hash}`, `${apiBase.origin}${apiBasePath}`),
+        init,
+      );
     }
 
     return originalFetch(input, init);

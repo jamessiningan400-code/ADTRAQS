@@ -1,0 +1,12 @@
+Options -MultiViews
+RewriteEngine On
+
+RewriteRule ^api/health$ api/health.php [L,QSA]
+RewriteRule ^api/docs$ api/docs.php [L,QSA]
+RewriteRule ^api/tracking$ api/tracking.php [L,QSA]
+RewriteRule ^api/tracking-update$ api/tracking-update.php [L,QSA]
+RewriteRule ^api/login$ api/auth/login.php [L,QSA]
+RewriteRule ^api/register$ api/auth/signup.php [L,QSA]
+RewriteRule ^api/auth/login$ api/auth/login.php [L,QSA]
+RewriteRule ^api/auth/signup$ api/auth/signup.php [L,QSA]
+RewriteRule ^api/users$ api/users.php [L,QSA]

@@ -160,6 +160,22 @@ Typical local flow:
 - document, tracking, and user data are returned as JSON to the front end
 - the UI renders workflows and updates state without a full page reload
 
+### Free capstone demo deployment (PHP/MySQL)
+
+The existing UI uses PHP endpoints for its document, group-tracking, user, and catalog workflows. For a short, low-traffic capstone demo, a PHP/MySQL shared host is a closer fit than deploying only the Node API. The production build is configured to call the PHP app under `/smartdocs` on the same domain.
+
+This is a demo setup, not production hosting. Use test data only. InfinityFree documents a 50,000-hit daily limit and possible 24-hour suspension after MySQL overload ([hit limit](https://forum.infinityfree.com/t/what-does-the-hits-limit-mean/49330), [MySQL overload](https://forum.infinityfree.com/t/what-does-mysql-overloading-mean/49333)). Its [browser security restrictions](https://forum.infinityfree.com/t/browser-security-system-features-and-limitations/49353) allow same-domain browser AJAX but may block cross-domain API calls and external tools; keep the frontend and PHP API on the same domain.
+
+1. Create a free PHP/MySQL hosting account and a MySQL database in the hosting control panel. Record the database host, database name, username, and password privately.
+2. In phpMyAdmin, select the database created by the host. Import `smartdocs-php/schema/smartdocs_mysql.sql` after removing its first two lines (`CREATE DATABASE ...` and `USE smartdocs_db;`) from a local copy. The hosted database name is assigned by the provider, so do not run those local database-selection statements.
+3. Copy `smartdocs-php/config/database.local.php.example` to `smartdocs-php/config/database.local.php` and fill it with the provider's database details. This local config is ignored by Git; do not commit it or share its password.
+4. Build the frontend from the repository root with `npm install` followed by `npm run build`.
+5. Upload the **contents** of `dist` to the host's web root (commonly `htdocs`). Upload the contents of `smartdocs-php` into a `smartdocs` folder under that same web root. The included `.htaccess` maps the clean API URLs used by the app to their PHP endpoints.
+6. Open the website, sign up with a demo account, then use phpMyAdmin to activate it as the first admin. In the host database's SQL tool, run `UPDATE users SET role = 'admin', office = 'City Administrative Office', status = 'active' WHERE email = 'your-demo-email@example.com';` with the same email used at signup.
+7. Check `https://your-domain/smartdocs/api/docs.php` in a browser. Once the schema and database credentials are correct, it should return JSON. Then open the website root and test login, document creation, tracking, and office links with demo data.
+
+The host-specific MySQL hostname is not necessarily `localhost`; use the exact value shown in its control panel. The browser-based interface and API should be hosted on the same domain. The Node service is not required for this PHP/MySQL deployment. The hosted database starts empty; the local SQLite databases and backup are intentionally not uploaded. The UI refreshes tracking frequently, so keep the demo low-traffic. Avoid using the free host for real records or expecting uploaded data to have guaranteed backup or retention.
+
 ## 6. System Components
 
 ### 6.1 Portal Application
