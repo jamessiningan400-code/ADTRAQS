@@ -1,0 +1,4 @@
+node_modules
+.vite/
+data/*.db
+backups/*.sql

@@ -1,0 +1,30 @@
+@keyframes smartdocs-page-enter {
+	from { opacity: 0; transform: translateY(10px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes smartdocs-modal-backdrop {
+	from { opacity: 0; }
+	to { opacity: 1; }
+}
+
+@keyframes smartdocs-modal-panel {
+	from { opacity: 0; transform: translateY(16px) scale(0.98); }
+	to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.page-enter { animation: smartdocs-page-enter 720ms cubic-bezier(.2,.8,.2,1) both; }
+.dashboard-reveal { animation: smartdocs-page-enter 900ms cubic-bezier(.2,.8,.2,1) both; }
+.tracking-reveal { animation: smartdocs-page-enter 2000ms cubic-bezier(.2,.8,.2,1) both; }
+.modal-backdrop-enter { animation: smartdocs-modal-backdrop 300ms ease-out both; }
+.modal-panel-enter { animation: smartdocs-modal-panel 520ms cubic-bezier(.2,.8,.2,1) both; }
+
+button:not(:disabled) { transition: transform 280ms ease, box-shadow 280ms ease, opacity 280ms ease; }
+button:not(:disabled):hover { transform: translateY(-1px); }
+button:not(:disabled):active { transform: translateY(0) scale(0.98); }
+
+@media (prefers-reduced-motion: reduce) {
+	.page-enter, .dashboard-reveal, .tracking-reveal, .modal-backdrop-enter, .modal-panel-enter { animation: none; }
+	button:not(:disabled) { transition: none; }
+	button:not(:disabled):hover, button:not(:disabled):active { transform: none; }
+}

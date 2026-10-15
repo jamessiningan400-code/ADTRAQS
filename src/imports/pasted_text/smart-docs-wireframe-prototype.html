@@ -1,0 +1,134 @@
+Design a functional wireframe prototype for a desktop web application called 
+"SMART DOCS" (Signature Monitoring and Automated Routing & Tracking of Documents 
+System) for the Office of the City Administrator, Gingoog City.
+Style: dark theme UI (navy/charcoal background #0B0E1A style, white text, purple 
+accent #6C4FF5 for primary data, orange for pending/warning states, red for 
+overdue, blue for informational states), card-based layout with rounded corners, 
+clean sans-serif typography, functional and data-dense but uncluttered.
+
+SYSTEM OVERVIEW
+A document tracking and signature monitoring system that replaces manual Excel 
+encoding and physical logbooks. It records documents (vouchers, payrolls, 
+checks/cheques), identifies the correct authorized signatory, tracks signature 
+status, and logs forwarding to other departments.
+
+USER ROLES (2 roles, separate login access)
+1. Staff (City Administrative Aide) — encodes documents, tracks status, forwards records
+2. Admin — everything Staff can do, plus user account management and system-wide reports
+
+SCREENS TO DESIGN
+
+1. Login Screen
+- Username/email field, password field, "Login" button, "Forgot password" link
+
+2. Analytics Dashboard (primary landing screen after login)
+Top navigation bar: system name/logo, global search bar, notifications bell, 
+user profile icon, logout.
+Sidebar navigation: Dashboard, Document Entry, Document Tracker, Signature 
+Monitoring, Reports, Archive, User Management (Admin only).
+
+Row 1 — three cards side by side:
+- Card A: "Signature Status Breakdown (This Week)" — donut chart with center 
+  label showing total document count. Segments: Completed (purple), Pending 
+  (orange), Overdue (red), For Signature (blue). Legend to the right of the 
+  donut listing each status with count and percentage.
+- Card B: "Pending Signatures by Signatory" — horizontal bar chart listing 
+  each signatory (City Administrator, CM, SB, and other office-specific 
+  signatories/departments) with a purple bar sized to their pending count, 
+  count labeled at bar end.
+- Card C: "Documents by Days Pending" — vertical bar chart with buckets: 
+  0-2 days, 3-5 days, 6-10 days, 11-15 days, >15 days. Purple bars, count 
+  labeled above each bar, taller bars for buckets with more documents to 
+  visually flag aging documents.
+
+Row 2 — two tables side by side:
+- Table A: "Documents Pending Signature (This Week)" with "View All" button 
+  top right. Columns: Control No., Document Type, Office, For Signature 
+  (assigned signatory), Date Sent, Days Pending, Status (color-coded badge: 
+  orange "Pending" / red "Overdue"). Pagination footer showing "Showing 1 to 
+  5 of [X] entries" with page number controls.
+- Table B: "Recently Completed Signatures (This Week)" with "View All" button 
+  top right. Columns: Control No., Document Type, Office, Signed By, Date 
+  Signed, Turnaround Time. Pagination footer matching Table A's style.
+
+Each table row is clickable, opening the Document Detail view for that record.
+
+3. Document Entry Screen
+Form fields matching the office's existing Excel structure:
+- Control No. (auto-generated, editable)
+- Date (date picker)
+- Type (dropdown: Voucher / Payroll / Check-Cheque / Other)
+- Office (dropdown, department origin)
+- Payroll/Voucher No. (text)
+- Particular/Details (text area)
+- Fund (dropdown: Fund source list)
+- Amount (numeric, conditional field)
+- Assigned Signatory (auto-suggested dropdown based on type/amount: CA / SB / 
+  CM / other signatories, editable)
+- Cheque No. (text, only shown when Type = Check/Cheque)
+- P.R. Number (text)
+Auto-suggest/autocomplete indicator showing "matched from previous records" 
+when typing in Particular/Details.
+Save and Save & Add New buttons.
+
+4. Document Tracker / List View
+- Filterable table: Control Number, Document Type, Department, Status 
+  (Pending Signature / Signed / Approved / Forwarded / Completed badges, 
+  color-coded), Assigned Signatory, Date Received, Days Pending
+- Filter panel: department, status, date range, signatory
+- Search bar with autocomplete
+- Click a row to open Document Detail view
+
+5. Document Detail / Status View
+- Document info summary at top
+- Status timeline/stepper: Received → Verified → Signatory Assigned → 
+  Forwarded for Signature → Signed → Returned → Updated → Forwarded to 
+  Department → Logged
+- Signature checklist (shown at "returned" stage): checkboxes for "Signature 
+  present", "All pages signed", "Ready to forward"
+- Action buttons relevant to current stage
+- Activity/audit log panel showing timestamped status history
+
+6. Signature Monitoring Screen
+- Board/table view grouped by signatory
+- Each signatory section shows their pending documents list with a days-pending 
+  badge, color-coded orange/red by aging
+- Small inline bar chart at top summarizing pending count per signatory 
+  (same style as dashboard Card B)
+
+7. Forwarding / Logbook Screen
+- Form to record forwarding: Destination Department (dropdown), Receiving 
+  Person, Date/Time, confirmation checkbox
+- Table of forwarding history
+
+8. Reports Screen
+- Filters: date range, department, document type
+- Report preview table
+- Export button (PDF/Excel placeholder)
+- Optional: reuse dashboard-style charts filtered by the selected date range
+
+9. Archive Screen
+- Searchable table of completed/archived documents
+- Read-only detail view on click
+
+10. User Management Screen (Admin only)
+- Table of users: Name, Role (Staff/Admin), Status (Active/Inactive), Last Login
+- Add User button (form: name, email, role, temporary password)
+- Edit/Deactivate actions per row
+
+FLOW/INTERACTIVITY
+- Login → Analytics Dashboard → Document Entry → Document Tracker → Document 
+  Detail → back to Dashboard
+- Dashboard table rows and chart segments are clickable, linking to filtered 
+  Document Tracker views
+- Admin-only screens accessible only from Admin's sidebar
+- Sidebar navigation clickable across all screens for full prototype flow
+
+LAYOUT NOTES
+- Desktop web app layout, fixed sidebar + top bar, scrollable content area
+- Dark theme throughout, consistent with the Analytics Dashboard style 
+  described above
+- Consistent card padding, rounded corners (8-12px), subtle borders instead 
+  of heavy shadows
+- Status colors used consistently across all screens: purple = completed/primary, 
+  orange = pending, red = overdue, blue = informational/in-progress
