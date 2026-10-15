@@ -17,7 +17,7 @@ if (!is_array($localConfig)) {
 }
 
 $host = getenv('SMARTDOCS_DB_HOST') ?: ($localConfig['host'] ?? '127.0.0.1');
-$db = getenv('SMARTDOCS_DB_NAME') ?: ($localConfig['database'] ?? 'smartdocs_db');
+$db = getenv('SMARTDOCS_DB_NAME') ?: ($localConfig['database'] ?? 'adtraqs');
 $user = getenv('SMARTDOCS_DB_USER') ?: ($localConfig['username'] ?? 'root');
 $environmentPassword = getenv('SMARTDOCS_DB_PASSWORD');
 $pass = $environmentPassword === false

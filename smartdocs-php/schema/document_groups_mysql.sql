@@ -1,4 +1,4 @@
-USE smartdocs_db;
+USE adtraqs;
 
 CREATE TABLE IF NOT EXISTS document_groups (
   id INT AUTO_INCREMENT PRIMARY KEY,
