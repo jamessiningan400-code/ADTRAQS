@@ -1,0 +1,4 @@
+Options -MultiViews
+RewriteEngine On
+
+RewriteRule ^api/(.+\.php)$ smartdocs/api/$1 [L,QSA]
