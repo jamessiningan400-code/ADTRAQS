@@ -176,6 +176,8 @@ This is a demo setup, not production hosting. Use test data only. InfinityFree d
 
 The host-specific MySQL hostname is not necessarily `localhost`; use the exact value shown in its control panel. The browser-based interface and API should be hosted on the same domain. The Node service is not required for this PHP/MySQL deployment. The hosted database starts empty; the local SQLite databases and backup are intentionally not uploaded. The UI refreshes tracking frequently, so keep the demo low-traffic. Avoid using the free host for real records or expecting uploaded data to have guaranteed backup or retention.
 
+The PHP database connection sets the MySQL session timezone to UTC+08:00 (Asia/Manila) so MySQL-generated timestamps such as `NOW()` match the PHP and UI timezone. This affects new timestamps; it does not rewrite existing records.
+
 ## 6. System Components
 
 ### 6.1 Portal Application

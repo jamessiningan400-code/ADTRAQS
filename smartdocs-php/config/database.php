@@ -34,6 +34,7 @@ $options = [
 
 try {
     $pdo = new PDO($dsn, $user, $pass, $options);
+    $pdo->exec("SET time_zone = '+08:00'");
 } catch (PDOException $e) {
     http_response_code(500);
     echo json_encode([
