@@ -5020,6 +5020,12 @@ function Reports({ docs, catalog, trackingRecords, groupTrackingRecords }:{
 
 interface UserRow { id:number; name:string; email:string; role:"Admin"|"Staff"; office:string; status:"Active"|"Pending"|"Inactive"; lastLogin:string; contactNumber:string; }
 const ADMINISTRATIVE_OFFICE = "City Administrative Office";
+const DEFAULT_MANAGED_OFFICES = [
+  ADMINISTRATIVE_OFFICE,
+  "City Treasurer Office",
+  "City Budget Office",
+  "City Accounting Office",
+];
 
 function UserManagement() {
   const C=useC();
@@ -5050,6 +5056,7 @@ function UserManagement() {
   useEffect(()=>{
     if (!usersLoaded) return;
     const availableOffices=Array.from(new Set([
+      ...DEFAULT_MANAGED_OFFICES,
       ...users.map(user=>user.office),
       ...officeStaff.map(member=>member.office),
     ].filter(Boolean)));
@@ -5179,6 +5186,7 @@ function UserManagement() {
   const visibleUsers=users.filter(u=>`${u.name} ${u.email} ${u.office}`.toLowerCase().includes(search.toLowerCase()));
   const visibleOfficeStaff=officeStaff.filter(member=>member.office===selectedOffice&&`${member.fullName} ${member.contactNumber}`.toLowerCase().includes(search.toLowerCase()));
   const availableOffices=Array.from(new Set([
+    ...DEFAULT_MANAGED_OFFICES,
     ...users.map(user=>user.office),
     ...officeStaff.map(member=>member.office),
   ].filter(Boolean)));
