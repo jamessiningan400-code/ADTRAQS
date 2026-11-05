@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/auth/session.php';
 
 header('Content-Type: application/json');
 
@@ -11,22 +12,26 @@ function respond(int $status, array $payload): void
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
-$staffOffices = ['City Administrative Office', 'City Treasurer Office', 'City Budget Office', 'City Accounting Office'];
 $adminOffice = 'City Administrative Office';
+$sessionUser = adtraqsGetSessionUser($pdo);
 
 try { $pdo->exec('ALTER TABLE users ADD COLUMN contact_number VARCHAR(20) NULL'); } catch (Throwable $ignored) {}
-$pdo->exec('CREATE TABLE IF NOT EXISTS office_staff (
+$pdo->exec('CREATE TABLE IF NOT EXISTS offices (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    full_name VARCHAR(150) NOT NULL,
-    contact_number VARCHAR(20) NOT NULL,
-    office VARCHAR(80) NOT NULL,
-    status ENUM("active", "inactive") NOT NULL DEFAULT "active",
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    name VARCHAR(100) NOT NULL UNIQUE,
+    is_active TINYINT(1) NOT NULL DEFAULT 1
 )');
 
 if ($method === 'GET') {
-    $stmt = $pdo->prepare('SELECT id, full_name, email, role, office, status, last_login, contact_number FROM users WHERE office = ? OR role = "admin" ORDER BY full_name ASC');
-    $stmt->execute([$adminOffice]);
+    if (!$sessionUser) {
+        respond(401, ['success' => false, 'message' => 'Sign in before viewing users.']);
+    }
+    if ($sessionUser['role'] === 'admin') {
+        $stmt = $pdo->query('SELECT id, full_name, email, role, office, status, last_login, contact_number FROM users ORDER BY office, full_name ASC');
+    } else {
+        $stmt = $pdo->prepare('SELECT id, full_name, email, role, office, status, last_login, contact_number FROM users WHERE id = ?');
+        $stmt->execute([(int) $sessionUser['id']]);
+    }
     $users = array_map(function (array $user): array {
         return [
             'id' => (int) $user['id'],
@@ -39,22 +44,19 @@ if ($method === 'GET') {
             'contactNumber' => $user['contact_number'] ?: '',
         ];
     }, $stmt->fetchAll());
-    $staffStmt = $pdo->query('SELECT id, full_name, contact_number, office, status FROM office_staff ORDER BY office, full_name');
-    $officeStaff = array_map(static function (array $member): array {
-        return [
-            'id' => (int) $member['id'],
-            'fullName' => $member['full_name'],
-            'contactNumber' => $member['contact_number'],
-            'office' => $member['office'],
-            'status' => ucfirst($member['status']),
-        ];
-    }, $staffStmt->fetchAll());
-    respond(200, ['success' => true, 'users' => $users, 'officeStaff' => $officeStaff]);
+    respond(200, ['success' => true, 'users' => $users]);
 }
 
 $data = json_decode(file_get_contents('php://input'), true) ?? [];
 
 if ($method === 'POST') {
+    if (!$sessionUser) {
+        respond(401, ['success' => false, 'message' => 'Sign in before managing users.']);
+    }
+    if ($sessionUser['role'] !== 'admin') {
+        respond(403, ['success' => false, 'message' => 'Only administrators can add users.']);
+    }
+
     $fullName = trim((string) ($data['full_name'] ?? ''));
     $email = strtolower(trim((string) ($data['email'] ?? '')));
     $password = (string) ($data['password'] ?? '');
@@ -62,36 +64,40 @@ if ($method === 'POST') {
     $office = trim((string) ($data['office'] ?? ''));
     $contactNumber = preg_replace('/\D+/', '', (string) ($data['contact_number'] ?? ''));
 
-    if ($office !== $adminOffice) {
-        if (!in_array($office, $staffOffices, true)) {
-            respond(400, ['success' => false, 'message' => 'Select a valid office.']);
-        }
-        if ($fullName === '') {
-            respond(400, ['success' => false, 'message' => 'First name and last name are required.']);
-        }
-        if (!preg_match('/^\d{11}$/', $contactNumber)) {
-            respond(400, ['success' => false, 'message' => 'Contact number must be exactly 11 digits only.']);
-        }
-        $stmt = $pdo->prepare('INSERT INTO office_staff (full_name, contact_number, office) VALUES (?, ?, ?)');
-        $stmt->execute([$fullName, $contactNumber, $office]);
-        respond(201, ['success' => true, 'message' => 'Office staff contact saved.']);
+    if ($office !== '' && strcasecmp($office, $adminOffice) === 0) {
+        $office = $adminOffice;
     }
 
-    if ($fullName === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($password) < 4 || !preg_match('/^\d{11}$/', $contactNumber)) {
-        respond(400, ['success' => false, 'message' => 'Enter a name, valid email, and password of at least 4 characters.']);
+    if ($office === '' || strlen($office) > 80) {
+        respond(400, ['success' => false, 'message' => 'Enter an office name of 80 characters or fewer.']);
     }
+
+    if ($fullName === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($password) < 4 || !preg_match('/^09\d{9}$/', $contactNumber)) {
+        respond(400, ['success' => false, 'message' => 'Enter a name, valid email, contact number starting with 09 and exactly 11 digits, and password of at least 4 characters.']);
+    }
+    if (strcasecmp($office, $adminOffice) === 0) {
+        $configuredOffice = $adminOffice;
+    } else {
+        $officeStmt = $pdo->prepare('SELECT name FROM offices WHERE name = ? AND is_active = 1 LIMIT 1');
+        $officeStmt->execute([$office]);
+        $configuredOffice = $officeStmt->fetchColumn();
+    }
+    if (!$configuredOffice) {
+        respond(400, ['success' => false, 'message' => 'Select an active office from Settings.']);
+    }
+    $office = (string) $configuredOffice;
     if (!in_array($role, ['admin', 'staff'], true)) {
         respond(400, ['success' => false, 'message' => 'Invalid role.']);
     }
     if ($role === 'admin') {
-        $office = $adminOffice;
+        if ($office !== $adminOffice) {
+            respond(400, ['success' => false, 'message' => 'Only City Administrative Office accounts can be administrators.']);
+        }
         $check = $pdo->prepare("SELECT COUNT(*) FROM users WHERE role = 'admin' AND office = ?");
         $check->execute([$adminOffice]);
         if ((int) $check->fetchColumn() >= 2) {
             respond(400, ['success' => false, 'message' => 'The City Administrative Office can only have two administrative users.']);
         }
-    } elseif ($office !== $adminOffice && !in_array($office, $staffOffices, true)) {
-        respond(400, ['success' => false, 'message' => 'Select a valid staff office.']);
     }
 
     try {
@@ -105,40 +111,17 @@ if ($method === 'POST') {
 }
 
 if ($method === 'PUT') {
-    $contactId = (int) ($data['contact_id'] ?? 0);
-    if ($contactId) {
-        $fullName = trim((string) ($data['full_name'] ?? ''));
-        $contactNumber = preg_replace('/\D+/', '', (string) ($data['contact_number'] ?? ''));
-        $office = trim((string) ($data['office'] ?? ''));
-        $status = strtolower(trim((string) ($data['status'] ?? 'active')));
-
-        if ($fullName === '' || !preg_match('/^\d{11}$/', $contactNumber)) {
-            respond(400, ['success' => false, 'message' => 'Name and an 11-digit contact number are required.']);
-        }
-        if (!in_array($office, $staffOffices, true)) {
-            respond(400, ['success' => false, 'message' => 'Select a valid office.']);
-        }
-        if (!in_array($status, ['active', 'inactive'], true)) {
-            respond(400, ['success' => false, 'message' => 'Select a valid status.']);
-        }
-
-        $stmt = $pdo->prepare('UPDATE office_staff SET full_name = ?, contact_number = ?, office = ?, status = ? WHERE id = ?');
-        $stmt->execute([$fullName, $contactNumber, $office, $status, $contactId]);
-        if ($stmt->rowCount() === 0) {
-            $exists = $pdo->prepare('SELECT 1 FROM office_staff WHERE id = ?');
-            $exists->execute([$contactId]);
-            if (!$exists->fetchColumn()) {
-                respond(404, ['success' => false, 'message' => 'Office staff record was not found.']);
-            }
-        }
-        respond(200, ['success' => true, 'message' => 'Office staff details updated.']);
-    }
-
     $id = (int) ($data['id'] ?? 0);
     $currentPassword = (string) ($data['current_password'] ?? '');
     $newPassword = (string) ($data['new_password'] ?? '');
+    if (!$sessionUser) {
+        respond(401, ['success' => false, 'message' => 'Sign in before updating your profile.']);
+    }
     if (!$id) {
         respond(400, ['success' => false, 'message' => 'User id is required.']);
+    }
+    if ((int) $sessionUser['id'] !== $id) {
+        respond(403, ['success' => false, 'message' => 'You can only update your own profile.']);
     }
     $userStmt = $pdo->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
     $userStmt->execute([$id]);
@@ -150,8 +133,8 @@ if ($method === 'PUT') {
     $email = strtolower(trim((string) ($data['email'] ?? $user['email'])));
     $username = strtolower(trim((string) ($data['username'] ?? $user['username'])));
     $contactNumber = preg_replace('/\D+/', '', (string) ($data['contact_number'] ?? $user['contact_number'] ?? ''));
-    if ($fullName === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || $username === '' || !preg_match('/^\d{11}$/', $contactNumber)) {
-        respond(400, ['success' => false, 'message' => 'Name, email, and username are required.']);
+    if ($fullName === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || $username === '' || !preg_match('/^09\d{9}$/', $contactNumber)) {
+        respond(400, ['success' => false, 'message' => 'Name, email, username, and a contact number starting with 09 and exactly 11 digits are required.']);
     }
     try {
         if ($newPassword !== '' && strlen($newPassword) < 4) {
@@ -167,6 +150,13 @@ if ($method === 'PUT') {
 }
 
 if ($method === 'PATCH') {
+    if (!$sessionUser) {
+        respond(401, ['success' => false, 'message' => 'Sign in before managing users.']);
+    }
+    if ($sessionUser['role'] !== 'admin') {
+        respond(403, ['success' => false, 'message' => 'Only administrators can manage users.']);
+    }
+
     $id = (int) ($data['id'] ?? 0);
     $status = strtolower(trim((string) ($data['status'] ?? '')));
     $role = strtolower(trim((string) ($data['role'] ?? '')));
@@ -197,12 +187,13 @@ if ($method === 'PATCH') {
 }
 
 if ($method === 'DELETE') {
-    $contactId = (int) ($data['contact_id'] ?? 0);
-    if ($contactId) {
-        $stmt = $pdo->prepare('DELETE FROM office_staff WHERE id = ?');
-        $stmt->execute([$contactId]);
-        respond(200, ['success' => true]);
+    if (!$sessionUser) {
+        respond(401, ['success' => false, 'message' => 'Sign in before managing users.']);
     }
+    if ($sessionUser['role'] !== 'admin') {
+        respond(403, ['success' => false, 'message' => 'Only administrators can manage users.']);
+    }
+
     $id = (int) ($data['id'] ?? 0);
     if (!$id) {
         respond(400, ['success' => false, 'message' => 'User id is required.']);

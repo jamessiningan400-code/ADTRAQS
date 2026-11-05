@@ -1,10 +1,10 @@
 <?php
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/session.php';
 
 $data = json_decode(file_get_contents('php://input'), true) ?? [];
 $email = strtolower(trim((string)($data['email'] ?? '')));
 $password = (string)($data['password'] ?? '');
-$office = trim((string)($data['office'] ?? ''));
 
 try { $pdo->exec('ALTER TABLE users ADD COLUMN contact_number VARCHAR(20) NULL'); } catch (Throwable $ignored) {}
 
@@ -30,30 +30,13 @@ if ($user['status'] !== 'active') {
     exit;
 }
 
-if ($office !== '' && strcasecmp($office, 'City Administrative Office') !== 0) {
-    http_response_code(401);
-    echo json_encode(['success' => false, 'message' => 'Office staff contacts do not use login credentials.']);
-    exit;
-}
-
-if ($office !== '' && $user['office'] !== $office) {
-    http_response_code(403);
-    echo json_encode(['success' => false, 'message' => 'This account is not assigned to this office.']);
-    exit;
-}
-
-if ($office === '' && $user['role'] !== 'admin' &&
-    !($user['role'] === 'staff' && strcasecmp(trim((string)($user['office'] ?? '')), 'City Administrative Office') === 0)) {
-    http_response_code(403);
-    echo json_encode(['success' => false, 'message' => 'This account is not assigned to the main ADTRAQS system. Use your office login.']);
-    exit;
-}
-
 $stmt = $pdo->prepare('UPDATE users SET last_login = NOW() WHERE id = ?');
 $stmt->execute([$user['id']]);
+$sessionToken = adtraqsSetSessionUser((int) $user['id']);
 
 echo json_encode([
     'success' => true,
+    'session_token' => $sessionToken,
     'user' => [
         'id' => (int)$user['id'],
         'full_name' => $user['full_name'],

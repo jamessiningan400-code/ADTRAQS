@@ -2,3 +2,13 @@ Options -MultiViews
 RewriteEngine On
 
 RewriteRule ^api/(.+\.php)$ smartdocs/api/$1 [L,QSA]
+RewriteRule ^api/health$ smartdocs/api/health.php [L,QSA]
+RewriteRule ^api/docs$ smartdocs/api/docs.php [L,QSA]
+RewriteRule ^api/tracking$ smartdocs/api/tracking.php [L,QSA]
+RewriteRule ^api/tracking-update$ smartdocs/api/tracking-update.php [L,QSA]
+RewriteRule ^api/login$ smartdocs/api/auth/login.php [L,QSA]
+RewriteRule ^api/register$ smartdocs/api/auth/signup.php [L,QSA]
+RewriteRule ^api/auth/login$ smartdocs/api/auth/login.php [L,QSA]
+RewriteRule ^api/auth/signup$ smartdocs/api/auth/signup.php [L,QSA]
+RewriteRule ^api/auth/logout$ smartdocs/api/auth/logout.php [L,QSA]
+RewriteRule ^api/users$ smartdocs/api/users.php [L,QSA]

@@ -39,9 +39,32 @@ const buildApiUrl = (path:string) => {
 
 const apiFetch = (path:string, init?: RequestInit) => fetch(buildApiUrl(path), init);
 
+function getDocumentTypeGroup(type:string):"financial"|"correspondence" {
+  return isOfficeCorrespondenceType(type)?"correspondence":"financial";
+}
+
 if (typeof window !== "undefined") {
   const originalFetch = window.fetch.bind(window);
   window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl = new URL(
+      input instanceof Request ? input.url : input.toString(),
+      window.location.origin,
+    );
+    const apiBase = new URL(API_BASE || window.location.origin, window.location.origin);
+    const apiBasePath = apiBase.pathname.replace(/\/+$/, "");
+    const apiPath = `${apiBasePath}/api/`;
+    const isRelativeApiRequest = requestUrl.origin === window.location.origin &&
+      requestUrl.pathname.startsWith("/api/");
+    const isConfiguredApiRequest = requestUrl.origin === apiBase.origin &&
+      requestUrl.pathname.startsWith(apiPath);
+    if (isRelativeApiRequest || isConfiguredApiRequest) {
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+      const sessionToken = getSavedSessionToken();
+      if (sessionToken) headers.set("X-ADTRAQS-SESSION", sessionToken);
+      init = { ...init, headers };
+    }
+
     if (typeof input === "string" && input.startsWith("/api") && API_BASE) {
       return originalFetch(buildApiUrl(input), init);
     }
@@ -74,9 +97,9 @@ function useTheme() {
 
 type Role    = "staff" | "admin";
 interface AuthUser { id:number; fullName:string; email:string; username?:string; role:Role; office:string; status:string; position?:string; contactNumber?:string; }
-type AppMode = "main" | "office-ct" | "office-cb" | "office-ca" | "processor";
+type AppMode = "main" | "office-ct" | "office-cb" | "office-ca" | "office-custom" | "processor";
 type AppScreen =
-  | "login" | "signup" | "dashboard" | "document-tracker"
+  | "login" | "signup" | "dashboard" | "document-tracker" | "document-tracking"
   | "tracking-monitoring"
   | "reports" | "user-management" | "settings" | "profile";
 type DocStatus = "For Signature" | "Completed";
@@ -90,6 +113,22 @@ interface SavedAppSession {
   role:Role;
   screen:AppScreen;
   theme:Theme;
+  sessionToken:string;
+}
+
+function getSavedSessionToken():string|null {
+  try {
+    const saved=window.sessionStorage.getItem(APP_SESSION_STORAGE_KEY);
+    if (!saved) return null;
+    const parsed:unknown=JSON.parse(saved);
+    return parsed&&typeof parsed==="object"&&
+      typeof (parsed as Record<string,unknown>).sessionToken==="string"
+      ?(parsed as Record<string,string>).sessionToken
+      :null;
+  } catch (error) {
+    console.error("Failed to read the saved server session token.",error);
+    return null;
+  }
 }
 
 function isSavedAppSession(value:unknown):value is SavedAppSession {
@@ -98,7 +137,7 @@ function isSavedAppSession(value:unknown):value is SavedAppSession {
   const user=session.user;
   if (!user||typeof user!=="object") return false;
   const savedUser=user as Record<string,unknown>;
-  const validScreen=["dashboard","document-tracker","tracking-monitoring",
+  const validScreen=["dashboard","document-tracker","document-tracking","tracking-monitoring",
     "reports","user-management","settings","profile"].some(screen=>screen===session.screen);
   return typeof savedUser.id==="number"&&
     typeof savedUser.fullName==="string"&&
@@ -107,6 +146,7 @@ function isSavedAppSession(value:unknown):value is SavedAppSession {
     typeof savedUser.office==="string"&&
     typeof savedUser.status==="string"&&
     session.role===savedUser.role&&
+    typeof session.sessionToken==="string"&&session.sessionToken.length>0&&
     validScreen&&
     (session.theme==="dark"||session.theme==="light");
 }
@@ -157,6 +197,11 @@ function normalizeSignature(value:string) {
   return value.trim().replace(/\s*[–—-]\s*/g," – ").replace(/\s+/g," ").toLocaleLowerCase();
 }
 
+function normalizePhilippineContactInput(value:string) {
+  const digits=value.replace(/\D/g,"").slice(0,11);
+  return !digits||"09".startsWith(digits)||digits.startsWith("09")?digits:"";
+}
+
 function getCatalogSignature(value:string, signatures:string[]) {
   const normalized=normalizeSignature(value);
   const exact=signatures.find(signature=>normalizeSignature(signature)===normalized);
@@ -168,26 +213,69 @@ function getCatalogSignature(value:string, signatures:string[]) {
 
 interface DocRecord {
   id: string; date: string; type: string; office: string;
+  source?:"city-admin"|"city-admin-correspondence"|"office";
+  title?:string; to?:string; from?:string; subject?:string;
+  createdBy?:number; createdByName?:string; createdOffice?:string;
+  updatedBy?:number|null; updatedByName?:string|null; updatedOffice?:string|null;
+  officeSequence?: number|null;
+  cityAdminControlNo?:string|null;
   payrollVoucher: string; particulars: string; fund: string;
   amount: number; signature: string; dateForwarded?: string; createdAt?: string;
   status: DocStatus; chequeNo?: string; dateReturned?: string;
   prNumber?: string; subType?: string; qrGenerated?: boolean;
-  processorName?:string; processorContactNumber?:string;
   flagData?: { reason: string; flaggedBy?: string; flaggedAt?: string };
   previousStatus?: DocStatus;
 }
 
-function hasCompleteDocumentDetails(doc:DocRecord, includeReturnDetails=false) {
-  const requiredDetails=[doc.type,doc.office,doc.payrollVoucher,doc.particulars,doc.fund,doc.signature];
+function getDocumentDisplayNumber(doc:DocRecord, viewerOffice=""):string {
+  if (doc.source==="office") {
+    return isCityAdminOffice(viewerOffice)&&doc.cityAdminControlNo
+      ?doc.cityAdminControlNo
+      :doc.id;
+  }
+  return viewerOffice&&!isCityAdminOffice(viewerOffice)&&doc.officeSequence!==null&&doc.officeSequence!==undefined
+    ?String(doc.officeSequence)
+    :doc.id;
+}
+
+function getDocumentDisplayLabel(doc:DocRecord, viewerOffice=""):string {
+  if (doc.source==="office") {
+    return isCityAdminOffice(viewerOffice)&&doc.cityAdminControlNo
+      ?`Control No. ${doc.cityAdminControlNo}`
+      :`Docs ID ${doc.id}`;
+  }
+  return viewerOffice&&!isCityAdminOffice(viewerOffice)&&doc.officeSequence!==null&&doc.officeSequence!==undefined
+    ?`Number ${doc.officeSequence}`
+    :`Control No. ${doc.id}`;
+}
+
+function isOfficeCorrespondenceType(type:string):boolean {
+  const normalized=type.trim().toUpperCase().replace(/[^A-Z]/g,"");
+  return normalized==="LETTER"||normalized==="MEMO"||normalized==="MEMORANDUM"||normalized==="MEMORANDOM";
+}
+
+function hasCompleteDocumentDetails(doc:DocRecord, includeReturnDetails=false, includeSignature=false) {
+  if (isOfficeCorrespondenceType(doc.type)) {
+    const requiredDetails=[doc.type,doc.office,doc.title??"",doc.to??"",doc.from??"",doc.date,doc.subject??""];
+    if (includeSignature) requiredDetails.push(doc.signature);
+    return requiredDetails.every(value=>value.trim().length>0);
+  }
+  const requiredDetails=[doc.type,doc.office,doc.payrollVoucher,doc.particulars,doc.fund];
+  if (doc.source!=="office"||includeSignature) requiredDetails.push(doc.signature);
   if (includeReturnDetails) requiredDetails.push(doc.chequeNo??"",doc.prNumber??"");
   return requiredDetails.every(value=>value.trim().length>0)&&Number.isFinite(doc.amount)&&doc.amount>=0;
 }
 
 function hasCompleteDocumentEntry(doc:DocRecord) {
+  if (isOfficeCorrespondenceType(doc.type)) {
+    return [doc.id,doc.type,doc.office,doc.title??"",doc.to??"",doc.from??"",doc.date,doc.subject??""]
+      .every(value=>value.trim().length>0);
+  }
   const requiredFields=[
     doc.id,doc.date,doc.type,doc.office,doc.payrollVoucher,doc.particulars,
-    doc.fund,doc.signature,doc.chequeNo??"",doc.subType??"",doc.prNumber??"",
+    doc.fund,doc.chequeNo??"",doc.subType??"",doc.prNumber??"",
   ];
+  if (doc.source!=="office") requiredFields.push(doc.signature);
   return requiredFields.every(value=>value.trim().length>0)&&Number.isFinite(doc.amount)&&doc.amount>=0;
 }
 
@@ -202,6 +290,11 @@ interface OfficeVisit extends OfficeStepData { office:string; }
 
 interface TrackingRecord {
   id: string; controlNo: string; particulars: string; type: string;
+  source?:"city-admin"|"office";
+  originOffice?:string;
+  cityAdminControlNo?:string|null;
+  title?:string; to?:string; from?:string; subject?:string; date?:string;
+  payrollVoucher?:string; fund?:string; amount?:number|null;
   initiatedAt: string;
   cto?: OfficeStepData; cbo?: OfficeStepData; cao?: OfficeStepData;
   caReturn?: { received?: string; receivedBy?: string };
@@ -246,11 +339,60 @@ const OFFICE_DISPLAY_NAME:Record<string,string>={
   CAO:"City Accounting Office",
   PRC:"Processors",
 };
+function getTrackingOfficeIdentifier(office:string):string {
+  const normalized=office.toLowerCase().replace(/[^a-z0-9]/g,"");
+  const identifiers:Record<string,string>={
+    ca:"CA",
+    cityadministrator:"CA",
+    cityadministrativeoffice:"CA",
+    cityadministratoroffice:"CA",
+    cityadministratorsoffice:"CA",
+    cityadminoffice:"CA",
+    cityadminsoffice:"CA",
+    officeofthecityadministrator:"CA",
+    cto:"CTO",
+    citytreasureroffice:"CTO",
+    citytreasurersoffice:"CTO",
+    cbo:"CBO",
+    citybudgetoffice:"CBO",
+    cao:"CAO",
+    cityaccountingoffice:"CAO",
+    cityaccountantoffice:"CAO",
+    cityaccountantsoffice:"CAO",
+    processor:"PRC",
+    processors:"PRC",
+  };
+  return identifiers[normalized]??office.trim();
+}
+function getOfficeAcronym(office:string):string {
+  const identifier=getTrackingOfficeIdentifier(office);
+  if (identifier!==office.trim()) return identifier;
+  const words=office.trim().match(/[A-Za-z0-9]+/g)??[];
+  const significantWords=words.filter(word=>!["and","of","the","for"].includes(word.toLowerCase()));
+  return significantWords.length>1
+    ?significantWords.map(word=>word[0]).join("").toUpperCase()
+    :office.trim().toUpperCase();
+}
+function isCityAdminOffice(office:string):boolean {
+  return getTrackingOfficeIdentifier(office)==="CA";
+}
+function getRoutingOfficeOptions(offices:string[]):string[] {
+  return [...new Set(offices.map(getTrackingOfficeIdentifier)
+    .filter(office=>office&&office!=="CA"&&office!=="PRC"))];
+}
+function getForwardDestinationOptions(offices:string[], sourceOffice:string):string[] {
+  const destinations=offices.map(getTrackingOfficeIdentifier)
+    .filter(office=>office&&office!==sourceOffice&&office!=="PRC");
+  return [...new Set([
+    ...destinations,
+    "CA",
+  ])];
+}
 const MODE_TO_STEP: Record<AppMode, string|null> = {
-  "main":null, "processor":null, "office-ct":"CTO", "office-cb":"CBO", "office-ca":"CAO",
+  "main":null, "processor":null, "office-ct":"CTO", "office-cb":"CBO", "office-ca":"CAO", "office-custom":null,
 };
 const MODE_OFFICE_NAME: Record<AppMode, string> = {
-  "main":"","processor":"",
+  "main":"","processor":"","office-custom":"",
   "office-ct":"City Treasurer Office",
   "office-cb":"City Budget Office",
   "office-ca":"City Accounting Office",
@@ -258,7 +400,9 @@ const MODE_OFFICE_NAME: Record<AppMode, string> = {
 const OFFICE_PORTAL_MODES: AppMode[] = ["office-ct","office-cb","office-ca","processor"];
 
 function getOfficePortalMode(): AppMode|null {
-  const requestedMode = new URLSearchParams(window.location.search).get("mode");
+  const params=new URLSearchParams(window.location.search);
+  const requestedMode=params.get("mode");
+  if (requestedMode==="office"&&params.get("office")?.trim()) return "office-custom";
   return OFFICE_PORTAL_MODES.find(mode => mode === requestedMode) ?? null;
 }
 
@@ -321,18 +465,23 @@ function fmtStepDate(ts:string) {
   return `${parts.month}/${parts.day}/${parts.year.slice(-2)} ${hour%12||12}:${parts.minute}${hour>=12?"PM":"AM"}`;
 }
 function parseControlNumberFromQr(rawValue:string): string | null {
-  const trimmed = rawValue.trim();
+  const trimmed=rawValue.trim();
   if (!trimmed) return null;
 
-  const explicit = trimmed.match(/(?:ADTRAQS|SMART[-_\s]*DOCS|CTL|CONTROL)[:\-_/\s]*?(\d{7})/i);
-  if (explicit) return explicit[1];
+  let value=trimmed.replace(/^#/,"");
+  const queryIndex=value.indexOf("?");
+  if (queryIndex>=0) {
+    const query=value.slice(queryIndex+1).split("#",1)[0];
+    const params=new URLSearchParams(query);
+    value=params.get("control")??params.get("control_no")??value;
+  }
+  value=value.trim().replace(/^#/,"");
 
-  const compact = trimmed.match(/(\d{7})/);
-  if (compact) return compact[1];
+  const explicit=value.match(/(?:ADTRAQS|SMART[-_\s]*DOCS|CTL|CONTROL)[:\-_/\s]*?([A-Z0-9]+(?:-[A-Z0-9]+)*)/i);
+  if (explicit) value=explicit[1];
 
-  const digitsOnly = trimmed.replace(/\D+/g, "");
-  if (digitsOnly.length >= 7) return digitsOnly.slice(-7);
-
+  if (/^\d{1,20}$/.test(value)) return value.length<7?value.padStart(7,"0"):value;
+  if (/^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$/i.test(value)) return value;
   return null;
 }
 function getProcessorDocumentUrl(controlNo:string):string {
@@ -365,7 +514,7 @@ function getTrackingActor(user:AuthUser|null|undefined) {
 }
 
 async function syncTrackingAction(payload:{controlNo:string;office:string;action:"receive"|"forSig"|"forward"|"complete"|"dispatch";forwardedTo?:string;actor?:string}) {
-  const response=await apiFetch('/api/tracking-update', {
+  const response=await apiFetch('/api/tracking-update?portal=1', {
     method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload),
   });
   const result=await response.json().catch(()=>null);
@@ -481,7 +630,7 @@ type OfficeInboxStage="Awaiting Receipt"|"For Signature"|"Ready to Forward";
 function getOfficeInboxStage(record:TrackingRecord, office:string):OfficeInboxStage|null {
   const position=getCurrentPosition(record);
   const lastVisit=record.visits?.at(-1);
-  if (["CTO","CBO","CAO"].includes(office)&&lastVisit?.forwardedTo==="PRC"&&
+  if (office!=="CA"&&lastVisit?.forwardedTo==="PRC"&&
       !!lastVisit.forwarded&&position.stage==="Awaiting Receipt") {
     return "Awaiting Receipt";
   }
@@ -534,7 +683,7 @@ function getTrackingNotifications(records:TrackingRecord[]):TrackingNotification
     const pos=getCurrentPosition(record);
     const notifications:TrackingNotification[]=[];
     if (pos.stage==="Awaiting Receipt") notifications.push({
-      id:`receipt-${record.id}`, title:"Receipt pending", detail:`#${record.controlNo} at ${pos.office}`,
+      id:`receipt-${record.id}`, title:"Receipt pending", detail:`${record.controlNo} at ${pos.office}`,
       controlNo:record.controlNo, tone:"info",
     });
     return notifications;
@@ -585,15 +734,28 @@ function Field({ label, children, size="default" }:{ label:string; children:Reac
   </div>;
 }
 
-function TInput({ placeholder="", type="text", value, onChange, readOnly=false, size="default" }:{
+function TInput({ placeholder="", type="text", value, onChange, readOnly=false, size="default", inputMode, maxLength }:{
   placeholder?:string; type?:string; value?:string; onChange?:(v:string)=>void; readOnly?:boolean; size?:"default"|"large";
+  inputMode?:React.HTMLAttributes<HTMLInputElement>["inputMode"]; maxLength?:number;
 }) {
   const C=useC();
-  return <input type={type} placeholder={placeholder} value={value} readOnly={readOnly}
+  const [passwordVisible,setPasswordVisible]=useState(false);
+  const input=<input type={type==="password"&&passwordVisible?"text":type} placeholder={placeholder} value={value} readOnly={readOnly} inputMode={inputMode} maxLength={maxLength}
     onChange={e=>onChange?.(e.target.value)}
-    className={`w-full rounded-xl px-3.5 ${size==="large"?"py-3 text-sm":"py-2.5 text-xs"} border outline-none`}
+    className={`w-full rounded-xl px-3.5 ${type==="password"?"pr-11 ":""}${size==="large"?"py-3 text-sm":"py-2.5 text-xs"} border outline-none`}
     style={{ background:readOnly?C.card:C.card2, borderColor:C.border,
       color:readOnly?C.muted:C.text, cursor:readOnly?"default":"text" }}/>;
+  if (type!=="password") return input;
+  return <div className="relative">
+    {input}
+    <button type="button" onClick={()=>setPasswordVisible(visible=>!visible)}
+      aria-label={passwordVisible?"Hide password":"Show password"}
+      title={passwordVisible?"Hide password":"Show password"}
+      className="absolute inset-y-0 right-1 flex w-10 items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2"
+      style={{ color:C.sub }}>
+      {passwordVisible?<EyeOff size={18}/>:<Eye size={18}/>}
+    </button>
+  </div>;
 }
 
 function TSelect({ options, value, onChange, placeholder="Select...", size="default", optionLabels }:{
@@ -653,7 +815,7 @@ function ModalOverlay({ onClose, children, wide=false }:{
   );
 }
 
-function QrPrintModal({ doc, onClose }:{ doc:DocRecord; onClose:()=>void }) {
+function QrPrintModal({ doc, onClose, viewerOffice }:{ doc:DocRecord; onClose:()=>void; viewerOffice?:string }) {
   const C=useC();
   const qrId=`forward-qr-${doc.id}`;
   const qrValue=getProcessorDocumentUrl(doc.id);
@@ -667,21 +829,12 @@ function QrPrintModal({ doc, onClose }:{ doc:DocRecord; onClose:()=>void }) {
         <div className="flex items-center justify-between mb-4">
           <div>
             <h3 className="text-sm font-bold" style={{ color:C.text }}>Document QR Label</h3>
-            <p className="text-xs mt-1" style={{ color:C.muted }}>Control No. #{doc.id}</p>
+            <p className="text-xs mt-1" style={{ color:C.muted }}>{getDocumentDisplayLabel(doc,viewerOffice)}</p>
           </div>
         </div>
         <div className="flex justify-center rounded-lg p-4" style={{ background:"#fff" }}>
           <QRCodeSVG id={qrId} value={qrValue} size={220} bgColor="#ffffff" fgColor="#0D1021" level="M"/>
         </div>
-        {doc.processorName&&(
-          <div className="mt-3 rounded-lg border p-4 text-center" style={{ borderColor:C.border, background:C.card2 }}>
-            <p className="text-base font-semibold" style={{ color:C.text }}>Processor</p>
-            <p className="mt-1 text-lg font-medium" style={{ color:C.sub }}>{doc.processorName}</p>
-            {doc.processorContactNumber&&(
-              <p className="mt-1 text-lg font-medium" style={{ color:C.sub }}>{doc.processorContactNumber}</p>
-            )}
-          </div>
-        )}
       </div>
     </div>,
     document.body
@@ -706,7 +859,7 @@ function GroupQrModal({ group, onClose }:{ group:GroupTrackingRecord; onClose:()
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-sm font-bold" style={{ color:C.text }}>SET QR Label</h3>
-              <p className="text-xs mt-1" style={{ color:C.muted }}>One QR · Control No. #{group.controlNo}</p>
+              <p className="text-xs mt-1" style={{ color:C.muted }}>One QR · Control No. {group.controlNo}</p>
             </div>
           </div>
           <div className="flex justify-center rounded-lg p-4" style={{ background:"#fff" }}>
@@ -848,15 +1001,18 @@ function JourneyStepper({ record, compact=false, labelColor }:{ record:TrackingR
     CAO:"City Accountant's Office", PRC:"Processors",
   };
   const visits=record.visits;
+  const originRoute=record.source==="office"
+    ?[]
+    :[{ office:"CA", timestamp:record.initiatedAt, done:true }];
   const route=visits&&visits.length>0
-    ?[{ office:"CA", timestamp:record.initiatedAt, done:true },
+    ?[...originRoute,
       ...visits.flatMap((visit,index)=>[
         { office:visit.office, timestamp:visit.received??visit.forSig??visit.forwarded, done:!!visit.received },
         ...(visit.forwardedTo&&visit.forwardedTo!==visit.office&&visits[index+1]?.office!==visit.forwardedTo
           ?[{ office:visit.forwardedTo, timestamp:undefined, done:false }]
           :[]),
       ])]
-    :[{ office:"CA", timestamp:record.initiatedAt, done:true },
+    :[...originRoute,
       ...(["CTO","CBO","CAO"] as const).flatMap(office=>{
         const key=office.toLowerCase() as JourneyStepKey;
         const step=record[key];
@@ -876,7 +1032,8 @@ function JourneyStepper({ record, compact=false, labelColor }:{ record:TrackingR
       {displayedRoute.map((node,i)=>{
         const done=node.done;
         const ts=node.timestamp;
-        const label=officeNames[node.office]??(node.office==="✓"?"Complete":node.office);
+        const fullLabel=officeNames[node.office]??(node.office==="✓"?"Complete":node.office);
+        const label=getOfficeAcronym(node.office);
         return (
           <Fragment key={`${node.office}-${i}`}>
             <div style={{ display:"flex", flexDirection:"column", alignItems:"center", flexShrink:0, width:sz+16 }}>
@@ -888,10 +1045,11 @@ function JourneyStepper({ record, compact=false, labelColor }:{ record:TrackingR
                 border:done?"none":`2px solid ${isDark?"#CBD5E1":"#C7CAD6"}`,
                 boxShadow:done?"0 2px 8px rgba(16,185,129,0.35)":"none",
               }}>
-                {node.office}
+                {label}
               </div>
               <div style={{ fontSize:compact?9:10, color:done?"#10B981":labelColor??C.muted,
-                textAlign:"center", marginTop:6, lineHeight:1.3, maxWidth:sz+16 }}>
+                textAlign:"center", marginTop:6, lineHeight:1.3, maxWidth:sz+16, whiteSpace:"nowrap" }}
+                title={fullLabel}>
                 {label}
               </div>
               {done&&ts&&(
@@ -910,13 +1068,18 @@ function JourneyStepper({ record, compact=false, labelColor }:{ record:TrackingR
 
 // ─── DOCUMENT STATUS CARD ─────────────────────────────────────────────────────
 
-function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=true, mutedTextColor="#8B93B0" }:{
+function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=true, mutedTextColor="#8B93B0", viewerOffice="" }:{
   record:TrackingRecord; doc?:DocRecord; stepKey?:JourneyStepKey; groupDocuments?:DocRecord[];
-  showSummary?:boolean; mutedTextColor?:string;
+  showSummary?:boolean; mutedTextColor?:string; viewerOffice?:string;
 }) {
   const summaryDocuments=groupDocuments?.length?groupDocuments:[doc];
-  const showPrNumber=summaryDocuments.some(member=>Boolean(member?.prNumber?.trim()));
+  const correspondence=isOfficeCorrespondenceType(doc?.type??summaryDocuments.find(member=>member)?.type??record.type);
+  const showPrNumber=!correspondence&&summaryDocuments.some(member=>Boolean(member?.prNumber?.trim()));
   const detailTextColor=mutedTextColor==="#000"?"#000":"#4B5680";
+  const isCityAdminViewer=isCityAdminOffice(viewerOffice);
+  const displayNumber=doc?.source==="office"&&isCityAdminViewer
+    ?doc.cityAdminControlNo??record.cityAdminControlNo??record.controlNo
+    :record.controlNo;
   const pos=doc?.status==="Completed"
     ? { office:"Complete", stage:"Complete" }
     : getCurrentPosition(record);
@@ -940,6 +1103,7 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
   };
   const sc=STAGE_CFG[pos.stage]??{ color:"#8B93B0", bg:"rgba(139,147,176,0.1)" };
   const journeyOffice=stepKey?({ cto:"CTO", cbo:"CBO", cao:"CAO" } as Record<JourneyStepKey,string>)[stepKey]:pos.office;
+  const currentOfficeName=OFFICE_NAME[pos.office]??pos.office;
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
@@ -948,10 +1112,12 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
       <div style={{ padding:"12px 16px", background:"#F7F8FC", borderBottom:"1px solid #E2E8F0",
         display:"flex", alignItems:"center", justifyContent:"space-between" }}>
         <div>
-          <p style={{ fontWeight:700, fontSize:13, color:"#1A2035", margin:0 }}>
-            {OFFICE_NAME[pos.office]??pos.office}
+          <p style={{ fontWeight:700, fontSize:13, color:"#1A2035", margin:0 }} title={currentOfficeName}>
+            {getOfficeAcronym(currentOfficeName)}
           </p>
-          <p style={{ fontSize:11, color:mutedTextColor, margin:"2px 0 0" }}>Control No.: #{record.controlNo}</p>
+          <p style={{ fontSize:11, color:mutedTextColor, margin:"2px 0 0" }}>
+            {isCityAdminViewer?`Control No.: ${displayNumber}`:`Docs ID: ${displayNumber}`}
+          </p>
           {groupDocuments?.length&&<p style={{ fontSize:10, color:mutedTextColor, margin:"2px 0 0" }}>{groupDocuments.length} documents · shared group tracking</p>}
         </div>
         <span style={{ fontSize:11, fontWeight:600, padding:"3px 10px", borderRadius:99,
@@ -960,7 +1126,11 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
       <table style={{ width:"100%", borderCollapse:"collapse" }}>
         <thead>
           <tr style={{ background:"#0D1021", borderBottom:"2px solid rgba(108,79,245,0.4)" }}>
-            {["Control No.","Particulars / Details","Type",...(showPrNumber?["P.R. No."]:[])].map(h=>(
+            {[
+              isCityAdminViewer?"Control No.":"Docs ID",
+              ...(!correspondence?["Particulars / Details"]:[]),
+              "Type",...(showPrNumber?["P.R. No."]:[]),
+            ].map(h=>(
               <th key={h} style={{ textAlign:"left", padding:"8px 12px", fontSize:11, fontWeight:700, color:"#fff", whiteSpace:"nowrap" }}>{h}</th>
             ))}
           </tr>
@@ -969,11 +1139,11 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
           {summaryDocuments.map((member,index)=>(
             <tr key={member?.id??`single-${index}`} style={{ borderBottom:"1px solid #E2E8F0" }}>
               <td style={{ padding:"10px 12px", fontSize:11, fontWeight:700, color:"#6C4FF5" }}>
-                #{member?.id??record.controlNo}
+                {isCityAdminViewer?member?.cityAdminControlNo??record.cityAdminControlNo??member?.id??record.controlNo:member?.id??record.controlNo}
               </td>
-              <td style={{ padding:"10px 12px", fontSize:11, color:detailTextColor }}>
+              {!correspondence&&<td style={{ padding:"10px 12px", fontSize:11, color:detailTextColor }}>
                 {member?.particulars??doc?.particulars??record.particulars}
-              </td>
+              </td>}
               <td style={{ padding:"10px 12px", fontSize:11, fontWeight:600, color:"#1A2035" }}>
                 {member?.type??doc?.type??record.type}
               </td>
@@ -991,7 +1161,8 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
       <section aria-label={`Office Journey in ${journeyOffice}`}>
       <div style={{ display:"flex", alignItems:"center", gap:8, margin:"0 4px 9px" }}>
         <span style={{ width:3, height:18, borderRadius:2, background:stepKey?({ cto:"#3B82F6", cbo:"#F59E0B", cao:"#10B981" } as Record<JourneyStepKey,string>)[stepKey]:"#6C4FF5" }}/>
-        <h3 style={{ fontSize:13, fontWeight:700, color:"#1A2035", margin:0 }}>Office Journey in {journeyOffice}</h3>
+        <h3 style={{ fontSize:13, fontWeight:700, color:"#1A2035", margin:0 }}
+          title={journeyOffice}>Office Journey in {getOfficeAcronym(journeyOffice)}</h3>
       </div>
       <div style={{ borderRadius:16, overflow:"hidden", background:"#fff", border:"1px solid #E2E8F0" }}>
         {journeyVisits.length?journeyVisits.map((visit,index)=>{
@@ -1005,12 +1176,13 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
             <article key={`${visit.office}-${index}`} style={{ padding:"14px 16px",
               borderBottom:index<journeyVisits.length-1?"1px solid #E2E8F0":"none" }}>
               <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8, marginBottom:10 }}>
-                <div style={{ fontSize:12, fontWeight:700, color:"#1A2035" }}>
-                  {OFFICE_NAME[visit.office]??visit.office}
+                <div style={{ fontSize:12, fontWeight:700, color:"#1A2035" }}
+                  title={OFFICE_NAME[visit.office]??visit.office}>
+                  {getOfficeAcronym(OFFICE_NAME[visit.office]??visit.office)}
                   <span style={{ marginLeft:6, fontSize:10, fontWeight:500, color:mutedTextColor }}>Visit {index+1}</span>
                 </div>
                 {visit.forwardedTo&&<span style={{ fontSize:10, fontWeight:600, color:"#059669", whiteSpace:"nowrap" }}>
-                  To {OFFICE_NAME[visit.forwardedTo]??visit.forwardedTo}
+                  To {getOfficeAcronym(OFFICE_NAME[visit.forwardedTo]??visit.forwardedTo)}
                 </span>}
               </div>
               <div style={{ display:"grid", gridTemplateColumns:`repeat(${actions.length},minmax(0,1fr))`, gap:8 }}>
@@ -1052,7 +1224,7 @@ function DocumentStatusCard({ record, doc, stepKey, groupDocuments, showSummary=
 // ─── CONFIRM ACTION MODAL ─────────────────────────────────────────────────────
 
 function ConfirmActionModal({ action, targetOffice, nextOffices, staff, defaultActor, trackingDetails, submitting=false, onConfirm, onCancel }:{
-  action:"receive"|"forward"|"complete"; targetOffice:string; nextOffices?:string[];
+  action:"receive"|"forSig"|"forward"|"complete"; targetOffice:string; nextOffices?:string[];
   staff?:OfficeStaffRow[]; defaultActor?:string; submitting?:boolean;
   trackingDetails?:{controlNo:string;particulars:string;type:string;office:string};
   onConfirm:(opts:{forwardedBy:string;forwardDest?:string})=>void; onCancel:()=>void;
@@ -1098,12 +1270,13 @@ function ConfirmActionModal({ action, targetOffice, nextOffices, staff, defaultA
               background:"rgba(16,185,129,0.15)", color:"#10B981" }}>✓</div>
             <div>
               <p style={{ fontWeight:700, fontSize:13, color:"#1A2035", margin:0 }}>
-                {action==="forward"?targetOffice:action==="complete"?"Complete Document Tracking":"Confirm Receipt"}
+                {action==="forward"?targetOffice:action==="complete"?"Complete Document Tracking":action==="forSig"?"Mark For Signature":"Confirm Receipt"}
               </p>
               <p style={{ fontSize:11, color:"#8B93B0", margin:"2px 0 0" }}>
                 {action==="forward"?"Please review the receiving office details before confirming."
                   :action==="complete"?"Are you sure you want to complete this document tracking?"
-                    :"Confirm receipt of this document."}
+                    :action==="forSig"?"Confirm this document is ready for signature."
+                      :"Confirm receipt of this document."}
               </p>
             </div>
           </div>
@@ -1111,11 +1284,23 @@ function ConfirmActionModal({ action, targetOffice, nextOffices, staff, defaultA
             style={{ fontSize:20, color:"#8B93B0", background:"none", border:"none", cursor:submitting?"default":"pointer", lineHeight:1 }}>×</button>
         </div>
         <div style={{ padding:"16px 20px", display:"flex", flexDirection:"column", gap:14 }}>
+          {action==="receive"&&trackingDetails&&(
+            <div style={{ borderRadius:12, padding:12, background:"#F7F8FC", border:"1px solid #E2E8F0" }}>
+              <p style={{ fontSize:11, fontWeight:700, color:"#1A2035", margin:"0 0 8px" }}>Receipt confirmation</p>
+              <p style={{ fontSize:12, color:"#475569", margin:"4px 0" }}>
+                City Admin control number:{" "}
+                <strong style={{ color:"#1A2035" }}>{trackingDetails.controlNo}</strong>.
+              </p>
+              <p style={{ fontSize:10, color:"#64748B", margin:"8px 0 0" }}>
+                Confirming receipt will add the document to City Admin Document Entry.
+              </p>
+            </div>
+          )}
           {action==="complete"&&trackingDetails&&(
             <div style={{ borderRadius:12, padding:12, background:"#F7F8FC", border:"1px solid #E2E8F0" }}>
               <p style={{ fontSize:11, fontWeight:700, color:"#1A2035", margin:"0 0 8px" }}>Completion details</p>
               {[
-                ["Control number",`#${trackingDetails.controlNo}`],
+                ["Control number",trackingDetails.controlNo],
                 ["Particulars",trackingDetails.particulars||"—"],
                 ["Document type",trackingDetails.type||"—"],
                 ["Destination",trackingDetails.office],
@@ -1192,7 +1377,7 @@ function ConfirmActionModal({ action, targetOffice, nextOffices, staff, defaultA
               style={{ width:"100%", borderRadius:12, padding:"12px", fontSize:14, fontWeight:700,
                 background:action==="complete"?"#10B981":"#6C4FF5", color:"#fff", border:"none", cursor:submitting?"wait":"pointer",
                 opacity:submitting?0.75:1 }}>
-              {submitting?"Saving...":action==="complete"?"Complete Tracking":"Confirm"}
+              {submitting?"Saving...":action==="complete"?"Complete Tracking":action==="forSig"?"Mark For Signature":"Confirm"}
             </button>
             <button onClick={onCancel} disabled={submitting}
               style={{ width:"100%", borderRadius:12, padding:"12px", fontSize:14, fontWeight:700,
@@ -1439,32 +1624,38 @@ function UserDropdown({ onProfile, onLogout, user }:{
 
 // ─── APP SHELL ────────────────────────────────────────────────────────────────
 
-function AppShell({ screen, setScreen, role, user, onLogout, onRefresh, refreshing, notifications, children }:{
+function AppShell({ screen, setScreen, role, user, onLogout, onReload, notifications, onOpenNotification, children }:{
   screen:AppScreen; setScreen:(s:AppScreen)=>void;
-  role:Role; user:AuthUser | null; onLogout:()=>void; onRefresh:()=>void; refreshing:boolean;
-  notifications:TrackingNotification[]; children:React.ReactNode;
+  role:Role; user:AuthUser | null; onLogout:()=>void; onReload:()=>void;
+  notifications:TrackingNotification[]; onOpenNotification:(controlNo:string)=>void; children:React.ReactNode;
 }) {
   const [collapsed,setCollapsed]=useState(false);
   const [notificationsOpen,setNotificationsOpen]=useState(false);
   const C=useC();
   const { theme }=useTheme();
   const isDark=theme==="dark";
+  const isCityAdmin=isCityAdminOffice(user?.office??"");
 
   const staffNav:{ id:AppScreen; label:string; icon:string }[]=[
     { id:"dashboard",           label:"Dashboard",          icon:"⊡" },
     { id:"document-tracker",    label:"Document Entry",     icon:"≡" },
+    { id:"document-tracking",   label:"Document Tracking",  icon:"⌖" },
     { id:"tracking-monitoring", label:"Tracking Monitoring",icon:"⊕" },
     { id:"reports",             label:"Reports",            icon:"▦" },
   ];
   const adminNav:{ id:AppScreen; label:string; icon:string; badge?:string }[]=[
     { id:"dashboard",           label:"Dashboard",          icon:"⊡" },
     { id:"document-tracker",    label:"Document Entry",     icon:"≡", badge:"View Only" },
+    { id:"document-tracking",   label:"Document Tracking",  icon:"⌖" },
     { id:"tracking-monitoring", label:"Tracking Monitoring",icon:"⊕" },
     { id:"reports",             label:"Reports",            icon:"▦" },
     { id:"user-management",     label:"User Management",    icon:"⊙" },
     { id:"settings",            label:"Settings",           icon:"⚙" },
   ];
-  const nav=role==="admin"?adminNav:staffNav;
+  const nav=(role==="admin"?adminNav:staffNav).filter(item=>
+    (isCityAdmin||!["dashboard","reports"].includes(item.id))&&
+    (!isCityAdmin||item.id!=="document-tracking"),
+  );
 
   const sidebarBorder=isDark?`1px solid ${C.border}`:`1px solid ${C.border}`;
 
@@ -1473,16 +1664,18 @@ function AppShell({ screen, setScreen, role, user, onLogout, onRefresh, refreshi
       <aside className={`${collapsed?"w-12":"w-56"} flex-shrink-0 flex flex-col`}
         style={{ background:C.sidebar, borderRight:sidebarBorder,
           boxShadow:isDark?"none":"2px 0 12px rgba(0,0,0,0.05)" }}>
-        <div className={`h-14 flex items-center border-b ${collapsed?"justify-center":"px-3 gap-2"}`}
+        <div className={`${collapsed?"h-14 justify-center":"min-h-16 px-3"} flex items-center border-b`}
           style={{ borderColor:C.border }}>
           <GingoogSeal size={28}/>
           {!collapsed&&(
-            <>
-              <span className="text-base font-bold flex-1 ml-1 whitespace-nowrap" style={{ color:C.text }}>ADTRAQS</span>
-              <button onClick={()=>setCollapsed(true)} className="text-xs opacity-40 hover:opacity-70"
-                style={{ color:C.sub }}>◀</button>
-            </>
+            <div className="min-w-0 flex-1 ml-2 py-2">
+              <span className="block text-base font-bold whitespace-nowrap" style={{ color:C.text }}>ADTRAQS</span>
+              {user?.office&&<span className="block text-[10px] leading-tight truncate" title={user.office}
+                style={{ color:C.muted }}>{user.office}</span>}
+            </div>
           )}
+          {!collapsed&&<button onClick={()=>setCollapsed(true)} className="text-xs opacity-40 hover:opacity-70"
+            style={{ color:C.sub }}>◀</button>}
         </div>
         {collapsed&&<button onClick={()=>setCollapsed(false)}
           className="py-1 text-xs text-center opacity-40 hover:opacity-70" style={{ color:C.sub }}>▶</button>}
@@ -1514,10 +1707,9 @@ function AppShell({ screen, setScreen, role, user, onLogout, onRefresh, refreshi
           style={{ background:C.sidebar, borderColor:C.border,
             boxShadow:isDark?"none":"0 2px 8px rgba(0,0,0,0.04)" }}>
           <div className="flex-1"/>
-          <button onClick={onRefresh} disabled={refreshing} title="Refresh data"
-            className={refreshing?"animate-spin":""}
+          <button onClick={onReload} title="Reload page and data" aria-label="Reload page and data"
             style={{ width:32, height:32, borderRadius:8, border:`1px solid ${C.border}`,
-              background:C.card2, color:C.sub, cursor:refreshing?"wait":"pointer", fontSize:16,
+              background:C.card2, color:C.sub, cursor:"pointer", fontSize:16,
               display:"flex", alignItems:"center", justifyContent:"center", padding:0, boxSizing:"border-box" }}>
             ↻
           </button>
@@ -1544,7 +1736,7 @@ function AppShell({ screen, setScreen, role, user, onLogout, onRefresh, refreshi
                 <div className="max-h-64 overflow-y-auto">
                   {notifications.length===0?<p className="px-4 py-5 text-xs" style={{ color:C.muted }}>No tracking notifications.</p>:
                     notifications.slice(0,8).map(notification=>(
-                      <button key={notification.id} onClick={()=>{ setNotificationsOpen(false); setScreen("tracking-monitoring"); }}
+                      <button key={notification.id} onClick={()=>{ setNotificationsOpen(false); onOpenNotification(notification.controlNo); }}
                         className="w-full text-left px-4 py-3 border-b"
                         style={{ borderColor:C.border, background:"transparent" }}>
                         <div className="flex items-center gap-2">
@@ -1587,7 +1779,7 @@ function FlagModal({ docId, onConfirm, onCancel }:{
           <div style={{ width:34, height:34, borderRadius:"50%", display:"flex", alignItems:"center",
             justifyContent:"center", background:"rgba(249,115,22,0.12)", fontSize:16 }}>⚑</div>
           <div>
-            <p style={{ fontWeight:700, fontSize:13, color:"#1A2035", margin:0 }}>Flag Document #{docId}</p>
+            <p style={{ fontWeight:700, fontSize:13, color:"#1A2035", margin:0 }}>Flag Document {docId}</p>
             <p style={{ fontSize:11, color:"#8B93B0", margin:"2px 0 0" }}>This document will be marked as Flagged.</p>
           </div>
         </div>
@@ -1710,8 +1902,9 @@ function ChangeDocumentDetailsModal({ doc, nextId, catalog, userId, onSave, onCa
         status:newDoc.status, cheque_no:newDoc.chequeNo, pr_number:doc.prNumber, date_returned:null,
         user_id:userId,
       })});
-      if (!response.ok) throw new Error('Unable to create replacement document');
-      onSave({...newDoc,prNumber:doc.prNumber});
+      const payload=await response.json().catch(()=>null);
+      if (!response.ok||!payload?.success) throw new Error(payload?.message??'Unable to create replacement document');
+      onSave({...newDoc,id:payload.control_no??newDoc.id,prNumber:doc.prNumber});
     } catch (error) {
       console.error('Replacement document error',error);
       alert('Unable to create the replacement document.');
@@ -1743,22 +1936,26 @@ function ChangeDocumentDetailsModal({ doc, nextId, catalog, userId, onSave, onCa
 
 // ─── BOTTLENECK CHART ─────────────────────────────────────────────────────────
 
-const BOTTLENECK_COLORS:Record<"CTO"|"CBO"|"CAO",string> = { CBO:"#EF4444", CTO:"#F97316", CAO:"#EAB308" };
+const BOTTLENECK_COLORS=["#6C4FF5","#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6","#14B8A6"];
 
-function formatProcessingDuration(days:number) {
-  return days<1?`${(days*24).toFixed(1)} hours avg`:`${days.toFixed(1)} days avg`;
+function formatProcessingDuration(minutes:number) {
+  return `${minutes.toFixed(1)} min avg`;
 }
 
-function BottleneckCard({ trackingRecords=[] }:{ trackingRecords?:TrackingRecord[] }) {
+function BottleneckCard({ trackingRecords=[],offices=[] }:{ trackingRecords?:TrackingRecord[];offices?:string[] }) {
   const C=useC();
   const { theme }=useTheme();
   const isDark=theme==="dark";
-  const nowParts=getSystemDateParts(new Date());
-  const weekStart=new Date(Date.UTC(Number(nowParts.year),Number(nowParts.month)-1,Number(nowParts.day)));
-  weekStart.setUTCDate(weekStart.getUTCDate()-((weekStart.getUTCDay()+6)%7));
-  const weekStartMs=parseSystemTimestamp(`${weekStart.toISOString().slice(0,10)} 00:00`).getTime();
-  const weekEndMs=weekStartMs+7*86400000;
-  const data=(["CTO","CBO","CAO"] as const).map(office=>{
+  const todayKey=systemDateKey(new Date());
+  const utcWeekday=new Date(`${todayKey}T00:00:00Z`).getUTCDay();
+  const daysSinceMonday=(utcWeekday+6)%7;
+  const weekStartMs=parseSystemTimestamp(`${todayKey} 00:00`).getTime()-daysSinceMonday*86400000;
+  const nextWeekStartMs=weekStartMs+7*86400000;
+  const configuredOffices=Array.from(new Map(offices
+    .map(name=>({name:name.trim(),code:getTrackingOfficeIdentifier(name)}))
+    .filter(office=>office.name&&office.code&&office.code!=="PRC")
+    .map(office=>[office.code,office] as const)).values());
+  const data=configuredOffices.map(({name,code:office},index)=>{
     const durations=trackingRecords.flatMap(record=>{
       const legacyStep=office==="CTO"?record.cto:office==="CBO"?record.cbo:record.cao;
       const steps=record.visits
@@ -1769,11 +1966,15 @@ function BottleneckCard({ trackingRecords=[] }:{ trackingRecords?:TrackingRecord
         const receivedAt=parseSystemTimestamp(step.received).getTime();
         const forwardedAt=parseSystemTimestamp(step.forwarded).getTime();
         if (!Number.isFinite(receivedAt)||!Number.isFinite(forwardedAt)||
-            forwardedAt<weekStartMs||forwardedAt>=weekEndMs||forwardedAt<receivedAt) return [];
-        return [(forwardedAt-receivedAt)/86400000];
+            forwardedAt<weekStartMs||forwardedAt>=nextWeekStartMs||forwardedAt<receivedAt) return [];
+        return [(forwardedAt-receivedAt)/60000];
       });
     });
-    return { office, avg:durations.length?durations.reduce((sum,value)=>sum+value,0)/durations.length:null, color:BOTTLENECK_COLORS[office] };
+    return {
+      office:name,
+      avg:durations.length?durations.reduce((sum,value)=>sum+value,0)/durations.length:null,
+      color:BOTTLENECK_COLORS[index%BOTTLENECK_COLORS.length],
+    };
   });
   const sorted=[...data].sort((a,b)=>{
     if (a.avg===null) return b.avg===null?0:1;
@@ -1794,36 +1995,40 @@ function BottleneckCard({ trackingRecords=[] }:{ trackingRecords?:TrackingRecord
           <p className="text-xs font-bold uppercase tracking-wider mb-0.5" style={{ color:C.muted }}>Office Bottleneck</p>
           <p className="text-sm font-bold" style={{ color:C.text }}>Average Processing Time</p>
         </div>
-        <div className="rounded-xl px-3 py-2 text-center" style={{
+        <div className="w-36 max-w-[40%] flex-shrink-0 rounded-lg px-2 py-1.5 text-center" style={{
           background:"rgba(239,68,68,0.1)", border:"1px solid rgba(239,68,68,0.25)" }}>
-          <p style={{ fontSize:9, fontWeight:600, color:"#EF4444", margin:"0 0 2px", whiteSpace:"nowrap" }}>
+          <p style={{ fontSize:8, fontWeight:600, color:"#EF4444", margin:"0 0 2px", whiteSpace:"nowrap" }}>
             SLOWEST THIS WEEK
           </p>
-          <p style={{ fontSize:13, fontWeight:800, color:"#EF4444", margin:0 }}>{slowest?slowest.office:"No data"}</p>
-          <p style={{ fontSize:10, color:"#EF4444", margin:0, opacity:0.8 }}>
+          <p className="truncate" title={slowest?.office??"No data"}
+            style={{ fontSize:11, fontWeight:800, color:"#EF4444", margin:0 }}>
+            {slowest?slowest.office:"No data"}
+          </p>
+          <p style={{ fontSize:9, color:"#EF4444", margin:0, opacity:0.8 }}>
             {slowestAvg==null?"No completed steps this week":formatProcessingDuration(slowestAvg)}
           </p>
         </div>
       </div>
-      <div className="space-y-3">
+      <div className="flex min-h-56 items-end gap-3 overflow-x-auto pt-3">
         {sorted.map(item=>{
-          const pct = item.avg == null || maxAvg===0 ? 0 : (item.avg / maxAvg) * 100;
+          const pct=item.avg===null||maxAvg===0?0:Math.max((item.avg/maxAvg)*100,4);
           return (
-            <div key={item.office}>
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs font-semibold" style={{ color:C.text }}>{item.office}</span>
-                <span className="text-xs font-bold" style={{ color:item.color }}>
-                  {item.avg===null?"No data":formatProcessingDuration(item.avg)}
-                </span>
+            <div key={item.office} className="flex h-52 min-w-20 flex-1 flex-col items-center justify-end">
+              <span className="mb-2 text-center text-xs font-bold whitespace-nowrap" style={{ color:item.color }}>
+                {item.avg===null?"No data":formatProcessingDuration(item.avg)}
+              </span>
+              <div className="flex h-36 w-full items-end rounded-t-md"
+                style={{ background:isDark?"rgba(255,255,255,0.06)":"#E9EBF3" }}>
+                <div className="w-full rounded-t-md transition-all duration-500"
+                  style={{ height:`${pct}%`,background:`linear-gradient(0deg,${item.color}99,${item.color})`,
+                    boxShadow:item.avg===null?"none":`0 0 8px ${item.color}55` }}/>
               </div>
-              <div style={{ height:10, borderRadius:6, background:isDark?"rgba(255,255,255,0.06)":"#E9EBF3", overflow:"hidden" }}>
-                <div style={{ height:"100%", width:`${item.avg===null?0:pct}%`, borderRadius:6,
-                  background:`linear-gradient(90deg,${item.color}99,${item.color})`,
-                  boxShadow:`0 0 6px ${item.color}55`, transition:"width 0.5s" }}/>
-              </div>
+              <span className="mt-2 max-w-full truncate text-center text-xs font-semibold"
+                style={{ color:C.text }} title={item.office}>{item.office}</span>
             </div>
           );
         })}
+        {sorted.length===0&&<p className="w-full self-center text-center text-sm" style={{ color:C.muted }}>No active offices are configured.</p>}
       </div>
     </div>
   );
@@ -1924,8 +2129,13 @@ function Dashboard({ role, setScreen, docs, trackingRecords, groupTrackingRecord
     if (entryPeriod==="year") return doc.date.startsWith(YEAR);
     return true;
   }).length;
-  const latestControlNumber=docs.reduce((latest,doc)=>
-    Number(doc.id)>Number(latest)?doc.id:latest,"" as string);
+  const latestEntry=docs.reduce<DocRecord|null>((latest,doc)=>{
+    if (!latest) return doc;
+    const docTimestamp=doc.createdAt??doc.date;
+    const latestTimestamp=latest.createdAt??latest.date;
+    return docTimestamp.localeCompare(latestTimestamp)>0?doc:latest;
+  },null);
+  const latestControlNumber=latestEntry?getDocumentDisplayNumber(latestEntry,user.office):"";
   const totalSignatures=selectedTotalSignature===null
     ?docs.filter(doc=>doc.signature.trim().length>0).length
     :docs.filter(doc=>getCatalogSignature(doc.signature,signatureOptions)===selectedTotalSignature).length;
@@ -1939,20 +2149,9 @@ function Dashboard({ role, setScreen, docs, trackingRecords, groupTrackingRecord
         text:C.text, sub:C.sub, muted:C.muted, link:C.purple }
     : { headerBg:"#0D1021", headerText:"#FFFFFF", rowBg:"#FFFFFF", rowAltBg:"#F7F8FC", rowBorder:"#E2E8F0",
         text:"#1A2035", sub:"#111827", muted:"#111827", link:"#6C4FF5" };
-  const dashboardDate=new Intl.DateTimeFormat(undefined,{
-    timeZone:SYSTEM_TIME_ZONE,weekday:"long",month:"long",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",
-  }).format(now);
 
   return (
     <div className="p-5 space-y-5">
-
-      <div className="flex items-center justify-between dashboard-reveal" style={{ animationDelay:"60ms" }}>
-        <div>
-          <div className="flex items-center gap-3 mb-0.5">
-            <h2 className="text-2xl font-extrabold tracking-tight" style={{ color:C.text }}>{dashboardDate}</h2>
-          </div>
-        </div>
-      </div>
 
       {/* ── Summary cards ── */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
@@ -2152,7 +2351,7 @@ function Dashboard({ role, setScreen, docs, trackingRecords, groupTrackingRecord
       </div>
 
       {/* ── Bottleneck analytics (full width) ── */}
-        <div className="dashboard-reveal" style={{ animationDelay:"700ms" }}><BottleneckCard trackingRecords={trackingRecords}/></div>
+        <div className="dashboard-reveal" style={{ animationDelay:"700ms" }}><BottleneckCard trackingRecords={trackingRecords} offices={catalog.offices}/></div>
 
       {/* ── Document tables ── */}
       <div className="grid grid-cols-2 gap-4">
@@ -2213,32 +2412,51 @@ function Dashboard({ role, setScreen, docs, trackingRecords, groupTrackingRecord
 
 // ─── DOC ENTRY MODAL ─────────────────────────────────────────────────────────
 
-function DocEntryModal({ nextId, catalog, userId, onClose, onSave }:{
-  nextId:string; catalog:CatalogData; userId:number; onClose:()=>void; onSave:(doc:DocRecord)=>void;
+function DocEntryModal({ nextId, catalog, userId, userOffice, onClose, onSave }:{
+  nextId:string; catalog:CatalogData; userId:number; userOffice:string; onClose:()=>void; onSave:(doc:DocRecord)=>void;
 }) {
   const C=useC();
+  const [displayedNextId,setDisplayedNextId]=useState(nextId);
+  const [displayedOfficeDocId,setDisplayedOfficeDocId]=useState<string|null>(null);
+  const [officeSequenceLoadFailed,setOfficeSequenceLoadFailed]=useState(false);
   const [type,setType]=useState(catalog.types[0]??"");
-  const [office,setOffice]=useState(""), [vendor,setVendor]=useState("");
+  const cityAdmin=isCityAdminOffice(userOffice);
+  const correspondence=isOfficeCorrespondenceType(type);
+  const [office,setOffice]=useState(cityAdmin?"":userOffice), [vendor,setVendor]=useState("");
   const [parts,setParts]=useState(""), [fund,setFund]=useState("");
   const [amount,setAmount]=useState(""), [sig,setSig]=useState("");
+  const [title,setTitle]=useState(""), [recipient,setRecipient]=useState("");
+  const [sender,setSender]=useState(""), [documentDate,setDocumentDate]=useState(""), [subject,setSubject]=useState("");
   const [saved,setSaved]=useState(false);
   const [loading,setLoading]=useState(false);
   const [saveError,setSaveError]=useState("");
   const nowDate=new Date(), nowFmt=fmtDateTimeDisplay(nowDate);
   const today=systemDateKey(nowDate);
-  const ok=type&&office&&vendor&&parts&&fund&&amount&&sig;
-  const buildDoc=():DocRecord=>({
-    id:nextId, date:today, createdAt:nowTs(), type, office, payrollVoucher:vendor, particulars:parts,
-    fund, amount:parseFloat(amount)||0, signature:sig, dateForwarded:"", status:"For Signature",
+  const ok=type&&office&&(correspondence
+    ?title.trim()&&recipient.trim()&&sender.trim()&&documentDate&&subject.trim()
+    :vendor&&parts&&fund&&amount&&(cityAdmin?sig:true));
+  const buildDoc=(id=displayedNextId):DocRecord=>({
+    id, source:cityAdmin?(correspondence?"city-admin-correspondence":"city-admin"):"office", date:correspondence?documentDate:today, createdAt:nowTs(), type, office,
+    payrollVoucher:correspondence?"":vendor, particulars:correspondence?subject:parts,
+    fund:correspondence?"":fund, amount:correspondence?0:parseFloat(amount)||0,
+    signature:cityAdmin?sig:"", title:correspondence?title.trim():"", to:correspondence?recipient.trim():"",
+    from:correspondence?sender.trim():"", subject:correspondence?subject.trim():"",
+    dateForwarded:"", status:"For Signature",
   });
-  const reset=()=>{ setType(catalog.types[0]??""); setOffice(""); setVendor(""); setParts(""); setFund(""); setAmount(""); setSig(""); setSaved(false); };
+  const reset=()=>{
+    setType(catalog.types[0]??""); setOffice(cityAdmin?"":userOffice); setVendor(""); setParts(""); setFund("");
+    setAmount(""); setSig(""); setTitle(""); setRecipient(""); setSender(""); setDocumentDate(""); setSubject(""); setSaved(false);
+  };
 
   const persistDocument=async(addAnother:boolean)=>{
     setLoading(true);
     setSaveError("");
     try {
       const doc=buildDoc();
-      const res=await fetch('/api/docs-crud.php',{
+      const endpoint=cityAdmin
+        ?correspondence?'/api/city-admin-correspondence.php':'/api/docs-crud.php'
+        :'/api/office-docs.php';
+      const res=await fetch(endpoint,{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
@@ -2250,7 +2468,13 @@ function DocEntryModal({ nextId, catalog, userId, onClose, onSave }:{
           particulars:doc.particulars,
           fund:doc.fund,
           amount:doc.amount,
-          signature:doc.signature,
+          ...(cityAdmin?{signature:doc.signature}:{}),
+          ...(correspondence?{
+            title:doc.title,
+            recipient:doc.to,
+            sender:doc.from,
+            subject:doc.subject,
+          }:{}),
           date_forwarded:null,
           status:doc.status,
           user_id:userId,
@@ -2260,7 +2484,11 @@ function DocEntryModal({ nextId, catalog, userId, onClose, onSave }:{
       if(!res.ok||!result?.success){
         throw new Error(result?.message||`Failed to save document (${res.status}).`);
       }
-      onSave({...doc,createdAt:result.created_at??doc.createdAt});
+      const savedDoc={...doc,id:cityAdmin?result.control_no??doc.id:result.doc_id??doc.id,createdAt:result.created_at??doc.createdAt};
+      if (typeof result.office_sequence==="number") savedDoc.officeSequence=result.office_sequence;
+      onSave(savedDoc);
+      if (typeof result.next_control_no==="string") setDisplayedNextId(result.next_control_no);
+      if (typeof result.next_office_doc_id==="string") setDisplayedOfficeDocId(result.next_office_doc_id);
       if(addAnother){ reset(); setSaved(true); }
       else onClose();
     }catch(e){
@@ -2270,6 +2498,26 @@ function DocEntryModal({ nextId, catalog, userId, onClose, onSave }:{
       setLoading(false);
     }
   };
+  useEffect(()=>{
+    let cancelled=false;
+    fetch('/api/docs-next-control.php',{cache:'no-store'})
+      .then(async response=>{
+        const result=await response.json();
+        if (!response.ok||!result?.success||typeof result.next_control_no!=="string"||
+          (!cityAdmin&&typeof result.next_office_doc_id!=="string")) {
+          throw new Error(result?.message??"Unable to load the next control number.");
+        }
+        if (!cancelled) setDisplayedNextId(result.next_control_no);
+        if (!cancelled&&typeof result.next_office_doc_id==="string") {
+          setDisplayedOfficeDocId(result.next_office_doc_id);
+        }
+      })
+      .catch(error=>{
+        console.error("Unable to load the next document number.",error);
+        if (!cancelled&&!cityAdmin) setOfficeSequenceLoadFailed(true);
+      });
+    return()=>{cancelled=true;};
+  },[]);
 
   return (
     <ModalOverlay onClose={onClose} wide>
@@ -2279,16 +2527,39 @@ function DocEntryModal({ nextId, catalog, userId, onClose, onSave }:{
           style={{ background:"rgba(16,185,129,0.15)", color:C.green }}>✓ Saved — enter next</span>}
       </div>
       <div className="grid grid-cols-2 gap-4">
-        <Field size="large" label="Control Number (auto)"><TInput size="large" value={nextId} readOnly/></Field>
-        <Field size="large" label="Date & Time (auto)"><TInput size="large" value={nowFmt} readOnly/></Field>
+        <Field size="large" label={cityAdmin?"Control Number (auto)":"Docs ID (auto)"}>
+          <TInput size="large" value={cityAdmin
+            ?displayedNextId
+            :officeSequenceLoadFailed
+              ?"Assigned on save"
+              :displayedOfficeDocId===null
+                ?"Loading..."
+                :displayedOfficeDocId} readOnly/>
+        </Field>
+        {correspondence
+          ?<Field size="large" label="Date"><TInput size="large" type="date" value={documentDate} onChange={value=>{setDocumentDate(value);setSaved(false);}}/></Field>
+          :<Field size="large" label="Date & Time (auto)"><TInput size="large" value={nowFmt} readOnly/></Field>}
         <Field size="large" label="Type"><TSelect size="large" options={catalog.types} value={type} onChange={v=>{setType(v as any);setSaved(false);}}/></Field>
-        <Field size="large" label="Office"><TSelect size="large" options={catalog.offices} value={office} onChange={v=>{setOffice(v);setSaved(false);}}/></Field>
-        <Field size="large" label="Payroll / Voucher"><TInput size="large" placeholder="Enter payroll or voucher reference" value={vendor} onChange={v=>{setVendor(v);setSaved(false);}}/></Field>
-        <Field size="large" label="Particular / Details"><TInput size="large" placeholder="Enter particulars or details" value={parts} onChange={v=>{setParts(v);setSaved(false);}}/></Field>
-        <Field size="large" label="Fund"><TSelect size="large" options={catalog.funds} value={fund} onChange={v=>{setFund(v);setSaved(false);}}/></Field>
-        <Field size="large" label="Amount"><TInput size="large" type="number" placeholder="0.00" value={amount} onChange={v=>{setAmount(v);setSaved(false);}}/></Field>
-        <Field size="large" label="Signature"><TSelect size="large" options={catalog.signatures} value={sig} onChange={v=>{setSig(v);setSaved(false);}}/></Field>
+        <Field size="large" label="Office">{cityAdmin
+          ?<TSelect size="large" options={catalog.offices} value={office} onChange={v=>{setOffice(v);setSaved(false);}}/>
+          :<TInput size="large" value={office} readOnly/>}</Field>
+        {correspondence?<>
+          <Field size="large" label="Title"><TInput size="large" placeholder="Enter document title" value={title} onChange={value=>{setTitle(value);setSaved(false);}}/></Field>
+          <Field size="large" label="To"><TInput size="large" placeholder="Enter recipient" value={recipient} onChange={value=>{setRecipient(value);setSaved(false);}}/></Field>
+          <Field size="large" label="From"><TInput size="large" placeholder="Enter sender" value={sender} onChange={value=>{setSender(value);setSaved(false);}}/></Field>
+          <Field size="large" label="Subject"><TInput size="large" placeholder="Enter subject" value={subject} onChange={value=>{setSubject(value);setSaved(false);}}/></Field>
+        </>:<>
+          <Field size="large" label="Payroll / Voucher"><TInput size="large" placeholder="Enter payroll or voucher reference" value={vendor} onChange={v=>{setVendor(v);setSaved(false);}}/></Field>
+          <Field size="large" label="Particular / Details"><TInput size="large" placeholder="Enter particulars or details" value={parts} onChange={v=>{setParts(v);setSaved(false);}}/></Field>
+          <Field size="large" label="Fund"><TSelect size="large" options={catalog.funds} value={fund} onChange={v=>{setFund(v);setSaved(false);}}/></Field>
+          <Field size="large" label="Amount"><TInput size="large" type="number" placeholder="0.00" value={amount} onChange={v=>{setAmount(v);setSaved(false);}}/></Field>
+        </>}
+        {cityAdmin&&<Field size="large" label="Signature"><TSelect size="large" options={catalog.signatures} value={sig} onChange={v=>{setSig(v);setSaved(false);}}/></Field>}
       </div>
+      {officeSequenceLoadFailed&&!cityAdmin&&
+        <p role="status" className="text-xs mt-2" style={{ color:C.muted }}>
+          The Docs ID will be assigned automatically when this document is saved.
+        </p>}
       {saveError&&<p role="alert" className="text-sm mt-3" style={{ color:C.red }}>{saveError}</p>}
       <div className="flex gap-3 mt-5 pt-4" style={{ borderTop:`1px solid ${C.border}` }}>
         <Btn size="large" disabled={!ok||loading} onClick={()=>void persistDocument(false)}>{loading?'Saving...':'Save'}</Btn>
@@ -2305,8 +2576,8 @@ function DocEntryModal({ nextId, catalog, userId, onClose, onSave }:{
 
 // ─── DOC EDIT MODAL ───────────────────────────────────────────────────────────
 
-function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onViewTracking, forwardActor, canRoute=false, detailsUnlocked=false, isGroupDocument=false, firstReturnAt }:{
-  doc:DocRecord; catalog:CatalogData; userId:number; onClose:()=>void; onSave:(d:DocRecord,forwardOffice?:string)=>void; onQrGenerate?:(id:string)=>void;
+function DocEditModal({ doc, catalog, userId, userOfficeName, forwardingOffice, onClose, onSave, onQrGenerate, onViewTracking, forwardActor, canRoute=false, detailsUnlocked=false, isGroupDocument=false, firstReturnAt }:{
+  doc:DocRecord; catalog:CatalogData; userId:number; userOfficeName:string; forwardingOffice:string; onClose:()=>void; onSave:(d:DocRecord,forwardOffice?:string)=>void; onQrGenerate?:(id:string)=>void;
   onViewTracking?: (id:string)=>void; forwardActor?:string; canRoute?:boolean; detailsUnlocked?:boolean; isGroupDocument?:boolean; firstReturnAt?:string;
 }) {
   const C=useC();
@@ -2315,6 +2586,9 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
   const typeOptions = catalog.types;
   const signatureOptions = catalog.signatures;
   const [e,setE]=useState(()=>({...doc,dateReturned:doc.dateReturned||firstReturnAt}));
+  const correspondence=isOfficeCorrespondenceType(e.type);
+  const cityAdminForwardedCorrespondence=doc.source==="office"&&
+    isCityAdminOffice(userOfficeName)&&correspondence;
   const [qrDone,setQr]=useState(doc.qrGenerated??false);
   const [loading,setLoading]=useState(false);
   const [saveError,setSaveError]=useState("");
@@ -2331,35 +2605,42 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
     setLoading(true);
     setSaveError("");
     try {
-      if (forwardOffice&&forwardOffice!=="PRC"&&!forwardActor) {
+      if (correspondence&&!hasCompleteDocumentDetails(e)) {
+        throw new Error("Complete the title, recipient, sender, date, and subject before saving.");
+      }
+      if (forwardOffice&&isCityAdminOffice(userOfficeName)&&
+          !hasCompleteDocumentDetails(e,!!e.dateReturned&&!e.dateReturned.startsWith("0000-"),true)) {
+        throw new Error("Complete the document details and select a signature before forwarding.");
+      }
+      if (forwardOffice&&!forwardActor) {
         throw new Error("Add your 11-digit contact number in your profile before forwarding this document.");
       }
-      if (forwardOffice==="PRC"&&(!e.processorName?.trim()||!e.processorContactNumber?.trim())) {
-        throw new Error("Enter the processor's complete name and 11-digit contact number before forwarding.");
-      }
-      const processorName=forwardOffice==="PRC"?e.processorName?.trim()??"":doc.processorName??"";
-      const processorContactNumber=forwardOffice==="PRC"
-        ?e.processorContactNumber?.trim()??""
-        :doc.processorContactNumber??"";
-      const res=await fetch('/api/docs-crud.php',{
+      const endpoint=doc.source==="city-admin-correspondence"
+        ?'/api/city-admin-correspondence.php'
+        :doc.source==="office"?'/api/office-docs.php':'/api/docs-crud.php';
+      const res=await fetch(endpoint,{
         method:'PUT',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
           id:doc.id,
+          date_entered:e.date,
           type:e.type,
           sub_type:e.subType??'',
           office:e.office,
-          payroll_voucher:e.payrollVoucher,
+          payroll_voucher:correspondence?'':e.payrollVoucher,
           signature:e.signature,
-          particulars:e.particulars,
-          fund:e.fund,
-          amount:e.amount,
+          particulars:correspondence?e.subject??'':e.particulars,
+          fund:correspondence?'':e.fund,
+          amount:correspondence?0:e.amount,
+          ...(doc.source==="office"||doc.source==="city-admin-correspondence"?{
+            title:correspondence?e.title??'':null,
+            recipient:correspondence?e.to??'':null,
+            sender:correspondence?e.from??'':null,
+            subject:correspondence?e.subject??'':null,
+          }:{}),
           cheque_no:e.chequeNo??'',
           pr_number:e.prNumber??'',
-          date_returned:forwardOffice&&forwardOffice!=="PRC"?null:(e.dateReturned??null),
-          processor_name:processorName,
-          processor_contact_number:processorContactNumber,
-          forward_to_processors:forwardOffice==="PRC",
+          date_returned:forwardOffice?null:(e.dateReturned??null),
           qr_generated:qrDone||!!e.qrGenerated,
           user_id:userId,
         }),
@@ -2370,10 +2651,10 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
       }
       const dateForwarded=updatePayload.dateForwarded??e.dateForwarded;
       let forwardWasNew=false;
-      if (forwardOffice&&forwardOffice!=="PRC") {
+      if (forwardOffice) {
         const response=await fetch('/api/tracking-update',{
           method:'POST', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({controlNo:doc.id,office:"CA",action:"dispatch",forwardedTo:forwardOffice,actor:forwardActor}),
+          body:JSON.stringify({controlNo:doc.id,office:forwardingOffice,action:"dispatch",forwardedTo:forwardOffice,actor:forwardActor}),
         });
         const payload=await response.json().catch(()=>null);
         if (!response.ok||!payload?.success) {
@@ -2382,7 +2663,7 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
         forwardWasNew=!payload.idempotent;
       }
       const wasForwarded=!!forwardOffice;
-      onSave({...e,processorName,processorContactNumber,qrGenerated:qrDone||!!e.qrGenerated,dateForwarded,status:wasForwarded?"Completed":doc.status},
+      onSave({...e,qrGenerated:qrDone||!!e.qrGenerated,dateForwarded,status:wasForwarded?"Completed":doc.status},
         forwardWasNew?forwardOffice:undefined);
       onClose();
     }catch(err){
@@ -2428,7 +2709,7 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
         }
       `}</style>
 
-      {!isGroupDocument&&<div className="qr-print-only" aria-hidden="true" style={{ display: "none" }}>
+      {!isGroupDocument&&doc.source!=="city-admin-correspondence"&&<div className="qr-print-only" aria-hidden="true" style={{ display: "none" }}>
         <div className="qr-print-card">
           <div className="text-[11px] font-bold tracking-[0.18em] uppercase mb-3" style={{ color: "#1f2937" }}>
             ADTRAQS
@@ -2442,24 +2723,61 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
             />
           </div>
           <div className="text-[11px] font-semibold" style={{ color: "#374151" }}>
-            Control No. #{doc.id}
+            Control No. {getDocumentDisplayNumber(doc,userOfficeName)}
           </div>
         </div>
       </div>}
 
       <ModalOverlay onClose={onClose} wide>
-        <div className="text-sm font-bold mb-4" style={{ color:C.text }}>✎ Edit Document — #{doc.id}</div>
+        <div className="text-sm font-bold mb-4" style={{ color:C.text }}>
+          ✎ Edit Document — {doc.source==="office"
+            ?getDocumentDisplayNumber(doc,userOfficeName)
+            :doc.id}
+        </div>
 
         <div className="grid grid-cols-2 gap-4">
-          <Field label="Control Number"><TInput value={e.id} readOnly /></Field>
-          <Field label="Date"><TInput value={e.date} readOnly /></Field>
-          <Field label="Type"><TSelect options={typeOptions} value={e.type} onChange={v => up("type", v as any)} /></Field>
-          <Field label="Office"><TSelect options={officeOptions} value={e.office} onChange={v => up("office", v)} /></Field>
-          <Field label="Payroll / Voucher"><TInput placeholder="Enter payroll or voucher" value={e.payrollVoucher} onChange={v => up("payrollVoucher", v)} /></Field>
-          <Field label="Particular / Details"><TInput placeholder="Enter particulars" value={e.particulars} onChange={v => up("particulars", v)} /></Field>
-          <Field label="Fund"><TSelect options={fundOptions} value={e.fund} onChange={v => up("fund", v)} /></Field>
-          <Field label="Amount"><TInput type="number" value={String(e.amount)} onChange={v => up("amount", parseFloat(v) || 0)} /></Field>
-          <Field label="Signature"><TSelect options={signatureOptions} value={e.signature} onChange={v => up("signature", v)} /></Field>
+          {cityAdminForwardedCorrespondence?<>
+            <Field label="Signature">
+              <TSelect options={signatureOptions} value={e.signature} onChange={v=>up("signature",v)} />
+            </Field>
+            {canRoute&&!isGroupDocument&&<Field label="Forward to office">
+              <TSelect options={getForwardDestinationOptions(catalog.offices,forwardingOffice)
+                .filter(office=>office!=="PRC")}
+                optionLabels={OFFICE_DISPLAY_NAME} value={forwardOffice} onChange={selectForwardOffice}
+                placeholder="Save without forwarding"/>
+            </Field>}
+          </>:<>
+          <Field label={doc.source==="office"&&!isCityAdminOffice(userOfficeName)?"Docs ID":"Control Number"}>
+            <TInput value={doc.source==="office"&&isCityAdminOffice(userOfficeName)&&doc.cityAdminControlNo
+              ?doc.cityAdminControlNo
+              :e.id} readOnly />
+          </Field>
+          <Field label="Date"><TInput type={correspondence?"date":"text"} value={e.date}
+            readOnly={!correspondence} onChange={value=>up("date",value)} /></Field>
+          <Field label="Type"><TSelect options={typeOptions} value={e.type} onChange={v => {
+            if ((doc.source==="office"||doc.source==="city-admin-correspondence")&&
+                isOfficeCorrespondenceType(v)!==isOfficeCorrespondenceType(doc.type)) {
+              setSaveError("A document cannot be changed between correspondence and financial document types.");
+              return;
+            }
+            up("type",v);
+          }} /></Field>
+          <Field label="Office">{isCityAdminOffice(userOfficeName)
+            ?<TSelect options={officeOptions} value={e.office} onChange={v => up("office", v)} />
+            :<TInput value={userOfficeName} readOnly/>}</Field>
+          {correspondence?<>
+            <Field label="Title"><TInput value={e.title??''} onChange={value=>up("title",value)}/></Field>
+            <Field label="To"><TInput value={e.to??''} onChange={value=>up("to",value)}/></Field>
+            <Field label="From"><TInput value={e.from??''} onChange={value=>up("from",value)}/></Field>
+            <Field label="Subject"><TInput value={e.subject??''} onChange={value=>up("subject",value)}/></Field>
+          </>:<>
+            <Field label="Payroll / Voucher"><TInput placeholder="Enter payroll or voucher" value={e.payrollVoucher} onChange={v => up("payrollVoucher", v)} /></Field>
+            <Field label="Particular / Details"><TInput placeholder="Enter particulars" value={e.particulars} onChange={v => up("particulars", v)} /></Field>
+            <Field label="Fund"><TSelect options={fundOptions} value={e.fund} onChange={v => up("fund", v)} /></Field>
+            <Field label="Amount"><TInput type="number" value={String(e.amount)} onChange={v => up("amount", parseFloat(v) || 0)} /></Field>
+          </>}
+          {(doc.source!=="office"||(isCityAdminOffice(userOfficeName)&&!correspondence))&&
+            <Field label="Signature"><TSelect options={signatureOptions} value={e.signature} onChange={v => up("signature", v)} /></Field>}
           {detailsUnlocked&&<>
             <Field label="Cheque No."><TInput type="text" placeholder="Bank cheque number" value={e.chequeNo ?? ""} onChange={v => up("chequeNo", v.replace(/\D/g,""))} /></Field>
             <Field label="Type (Secondary)"><TInput placeholder="Secondary classification" value={e.subType ?? ""} onChange={v => up("subType", v)} /></Field>
@@ -2467,32 +2785,14 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
           </>}
           {canRoute&&detailsUnlocked&&e.dateForwarded&&!e.dateForwarded.startsWith("0000-")&&<Field label="Date Forwarded"><TInput value={fmtLocalDateTime(e.dateForwarded)} readOnly /></Field>}
           {detailsUnlocked&&<Field label="Date Fwd. (Returned) - auto"><TInput value={e.dateReturned?fmtLocalDateTime(e.dateReturned):""} readOnly /></Field>}
-          {canRoute&&!isGroupDocument&&!detailsUnlocked&&<Field label="Forward to office">
-            <TSelect options={["CTO","CBO","CAO","PRC"]} optionLabels={OFFICE_DISPLAY_NAME}
+          {canRoute&&!isGroupDocument&&(!detailsUnlocked||isCityAdminOffice(userOfficeName))&&<Field label="Forward to office">
+            <TSelect options={getForwardDestinationOptions(catalog.offices,forwardingOffice).filter(office=>office!=="PRC")} optionLabels={OFFICE_DISPLAY_NAME}
               value={forwardOffice} onChange={selectForwardOffice} placeholder="Save without forwarding"/>
           </Field>}
+          </>}
         </div>
 
-        {forwardOffice==="PRC"&&(
-          <div className="mt-4 grid grid-cols-2 gap-4 rounded-xl border p-4"
-            style={{ borderColor:C.border, background:C.card2 }}>
-            <div className="col-span-2">
-              <p className="text-xs font-semibold" style={{ color:C.text }}>Processor details</p>
-              <p className="mt-1 text-xs" style={{ color:C.muted }}>
-                Enter the processor carrying this document. This saves the details without assigning an office.
-              </p>
-            </div>
-            <Field label="Complete name">
-              <TInput value={e.processorName??""} onChange={value=>up("processorName",value)}/>
-            </Field>
-            <Field label="Contact number">
-              <TInput type="tel" value={e.processorContactNumber??""}
-                onChange={value=>up("processorContactNumber",value.replace(/\D/g,"").slice(0,11))}/>
-            </Field>
-          </div>
-        )}
-
-        {!isGroupDocument&&<div className="mt-5 pt-4" style={{ borderTop: `1px solid ${C.border}` }}>
+        {!cityAdminForwardedCorrespondence&&!isGroupDocument&&doc.source!=="city-admin-correspondence"&&<div className="mt-5 pt-4" style={{ borderTop: `1px solid ${C.border}` }}>
           <p className="text-xs font-semibold mb-3" style={{ color:C.sub }}>QR Code Label</p>
           {!qrDone ? (
             <button
@@ -2522,7 +2822,7 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
                   ✓ QR Code Generated
                 </span>
                 <p className="text-xs mt-2 mb-3" style={{ color:C.muted }}>
-                  Control No. #{doc.id} · One QR per document.
+                  Control No. {doc.id} · One QR per document.
                 </p>
                 <button
                   onClick={() => {
@@ -2587,7 +2887,7 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
                           <div class="label">
                             <div class="brand">ADTRAQS</div>
                             <div class="qr-wrap">${svgMarkup}</div>
-                            <div class="control">Control No. #${doc.id}</div>
+                            <div class="control">Control No. ${doc.id}</div>
                           </div>
                         </body>
                       </html>`);
@@ -2627,18 +2927,21 @@ function DocEditModal({ doc, catalog, userId, onClose, onSave, onQrGenerate, onV
 
 // ─── DOCUMENT TRACKER ─────────────────────────────────────────────────────────
 
-function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecords, catalog, setDocs, setTracking, setGroupTrackingRecords, openDocumentId, onOpenDocumentHandled, onViewTracking }:{
+function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecords, catalog, setDocs, setTracking, setGroupTrackingRecords, openDocumentId, onOpenDocumentHandled, openTrackingId, onOpenTrackingHandled, onViewTracking }:{
   role:Role; docs:DocRecord[]; trackingRecords:TrackingRecord[]; catalog:CatalogData; setDocs:React.Dispatch<React.SetStateAction<DocRecord[]>>;
   groupTrackingRecords:GroupTrackingRecord[]; setGroupTrackingRecords:React.Dispatch<React.SetStateAction<GroupTrackingRecord[]>>;
   user:AuthUser|null;
   setTracking:React.Dispatch<React.SetStateAction<TrackingRecord[]>>; openDocumentId?:string;
-  onOpenDocumentHandled?:()=>void; onViewTracking?:(id:string)=>void;
+  onOpenDocumentHandled?:()=>void; openTrackingId?:string; onOpenTrackingHandled?:()=>void; onViewTracking?:(id:string)=>void;
 }) {
   const C=useC();
   const { theme }=useTheme();
   const isDark=theme==="dark";
   const [showEntry,setShowEntry]=useState(false), [editDoc,setEditDoc]=useState<DocRecord|null>(null);
   const [detailDoc,setDetailDoc]=useState<DocRecord|null>(null);
+  const [incomingTracking,setIncomingTracking]=useState<TrackingRecord|null>(null);
+  const [showIncomingReceipt,setShowIncomingReceipt]=useState(false);
+  const [incomingReceiptSubmitting,setIncomingReceiptSubmitting]=useState(false);
   const [qrDoc,setQrDoc]=useState<DocRecord|null>(null);
   const [groupQr,setGroupQr]=useState<GroupTrackingRecord|null>(null);
   const [hoveredGroupQrId,setHoveredGroupQrId]=useState<number|null>(null);
@@ -2651,9 +2954,17 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
   const [routeAgainGroupOffice,setRouteAgainGroupOffice]=useState("");
   const [routeAgainLoading,setRouteAgainLoading]=useState(false);
   const [receivingControlNo,setReceivingControlNo]=useState<string|null>(null);
-  const [fOffice,setFOffice]=useState(""), [fType,setFType]=useState(""), [fSignature,setFSignature]=useState("");
+  const [fOffice,setFOffice]=useState(""), [fType,setFType]=useState<"financial"|"correspondence">("financial"), [fSignature,setFSignature]=useState("");
   const [search,setSearch]=useState("");
   const actor=getTrackingActor(user);
+  const isCityAdminViewer=isCityAdminOffice(user?.office??"");
+  const documentNumberLabel=isCityAdminViewer?"Control No.":"Docs ID";
+  const detailUsesOfficeNumber=!!user&&!isCityAdminOffice(user.office)&&
+    detailDoc?.officeSequence!==null&&detailDoc?.officeSequence!==undefined;
+  const detailNumberLabel=detailUsesOfficeNumber?"Number":"Control No.";
+  const detailNumber=detailUsesOfficeNumber
+    ?getDocumentDisplayNumber(detailDoc!,user?.office)
+    :`${detailDoc?getDocumentDisplayNumber(detailDoc,user?.office):""}`;
   const nextId=String(docs.reduce((max,doc)=>{
     const id=Number(doc.id);
     return Number.isSafeInteger(id)?Math.max(max,id):max;
@@ -2663,10 +2974,18 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
     if (!openDocumentId) return;
     const target=docs.find(doc=>doc.id===openDocumentId);
     if (!target) return;
-    if (role==="admin") setDetailDoc(target);
-    else if (canEditDoc(target)) setEditDoc(target);
+    if (role==="admin"||!canEditDoc(target)) setDetailDoc(target);
+    else setEditDoc(target);
     onOpenDocumentHandled?.();
   },[docs,openDocumentId,onOpenDocumentHandled,role]);
+
+  useEffect(()=>{
+    if (!openTrackingId) return;
+    const record=trackingRecords.find(item=>item.controlNo===openTrackingId);
+    if (!record) return;
+    setIncomingTracking(record);
+    onOpenTrackingHandled?.();
+  },[openTrackingId,onOpenTrackingHandled,trackingRecords]);
 
   const LT=isDark
     ? { headerBg:C.sidebar, headerText:C.text, rowBg:C.card, rowAltBg:C.card2, rowBorder:C.border,
@@ -2675,6 +2994,44 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
         text:"#1A2035", sub:"#111827", muted:"#111827", link:"#6C4FF5" };
 
   const handleQr=(id:string)=>setDocs(p=>p.map(d=>d.id===id?{...d,qrGenerated:true}:d));
+  const handleIncomingReceipt=async(opts:{forwardedBy:string})=>{
+    if (!incomingTracking||incomingReceiptSubmitting) return;
+    setIncomingReceiptSubmitting(true);
+    try {
+      const response=await fetch('/api/tracking-update.php',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({controlNo:incomingTracking.controlNo,office:"CA",action:"receive",actor:opts.forwardedBy}),
+      });
+      const payload=await response.json().catch(()=>null);
+      if (!response.ok||!payload?.success) {
+        throw new Error(payload?.message??`Receipt failed (${response.status})`);
+      }
+      const [docsResponse,trackingResponse]=await Promise.all([
+        fetch('/api/docs',{cache:'no-store'}),
+        fetch('/api/tracking',{cache:'no-store'}),
+      ]);
+      const [docsPayload,trackingPayload]=await Promise.all([
+        docsResponse.json().catch(()=>null),
+        trackingResponse.json().catch(()=>null),
+      ]);
+      if (!docsResponse.ok||!docsPayload?.success) {
+        throw new Error(docsPayload?.message??`Document list refresh failed (${docsResponse.status})`);
+      }
+      if (!trackingResponse.ok||!trackingPayload?.success) {
+        throw new Error(trackingPayload?.message??`Tracking refresh failed (${trackingResponse.status})`);
+      }
+      setDocs(docsPayload.docs??[]);
+      const updatedRecords:TrackingRecord[]=trackingPayload.tracking??[];
+      setTracking(updatedRecords);
+      setIncomingTracking(null);
+      setShowIncomingReceipt(false);
+    } catch(error) {
+      alert(error instanceof Error?error.message:"Unable to confirm document receipt.");
+    } finally {
+      setIncomingReceiptSubmitting(false);
+    }
+  };
   const hasCityAdminReceipt=(doc:DocRecord)=>{
     const record=trackingRecords.find(item=>item.controlNo===doc.id);
     const group=groupTrackingRecords.find(item=>item.documents.some(member=>member.id===doc.id));
@@ -2683,16 +3040,42 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
   };
   const canEditDoc=(doc:DocRecord)=>{
     const group=groupTrackingRecords.find(item=>item.documents.some(member=>member.id===doc.id));
+    const assignedOffice=getTrackingOfficeIdentifier(user?.office??"");
+    const isCompleteAtCityAdmin=(journey:TrackingRecord|GroupTrackingRecord)=>{
+      const visits=journey.visits??[];
+      const lastVisit=visits.at(-1);
+      return visits.length
+        ?lastVisit?.office==="CA"&&!!lastVisit.received&&!lastVisit.forwarded
+        :!!journey.caReturn?.received;
+    };
     if (group) {
       const position=getCurrentPosition(group);
+      if (assignedOffice!=="CA") return position.office===assignedOffice;
       return (position.office==="CA"&&position.stage==="Received")||
-        (position.office==="Complete"&&!!getForwardedTimestamp(doc));
+        (position.office==="Complete"&&isCompleteAtCityAdmin(group)&&
+          !!getReturnedTimestamp(doc)&&!!getForwardedTimestamp(doc));
     }
     const record=trackingRecords.find(item=>item.controlNo===doc.id);
     if (!record) return true;
     const position=getCurrentPosition(record);
+    if (assignedOffice!=="CA") return position.office===assignedOffice;
     return (position.office==="CA"&&position.stage==="Received")||
-      (position.office==="Complete"&&!!getForwardedTimestamp(doc));
+      (position.office==="Complete"&&isCompleteAtCityAdmin(record)&&
+        !!getReturnedTimestamp(doc)&&!!getForwardedTimestamp(doc));
+  };
+  const getDocumentLocationStatus=(doc:DocRecord)=>{
+    const group=groupTrackingRecords.find(item=>item.documents.some(member=>member.id===doc.id));
+    const record=trackingRecords.find(item=>item.controlNo===doc.id);
+    const journey=group??record;
+    const position=journey?getCurrentPosition(journey):null;
+    const lastVisit=journey?.visits?.at(-1);
+    const office=position?.office==="Complete"
+      ?lastVisit?.office??(journey?.caReturn?.received?"CA":"Complete")
+      :position?.office??getTrackingOfficeIdentifier(doc.office);
+    if (office==="Complete") return "Completed";
+    const officeName=OFFICE_DISPLAY_NAME[office]??
+      catalog.offices.find(name=>getTrackingOfficeIdentifier(name)===office)??office;
+    return `${getOfficeAcronym(officeName)} · ${position?.office==="Complete"?"Completed":position?.stage??doc.status}`;
   };
   const getOfficeForwardInfo=(doc:DocRecord)=>{
     const trackingRecord=trackingRecords.find(item=>item.controlNo===doc.id);
@@ -2716,12 +3099,10 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
     };
     const latestRoute=visits.filter(visit=>visit.forwardedTo).at(-1);
     if (!latestRoute?.forwardedTo) {
-      const processorReceipt=doc.processorName?.trim()&&doc.processorContactNumber?.trim()
-        ?getProcessorReceipt()
-        :undefined;
+      const processorReceipt=getProcessorReceipt();
       return {
-        label:processorReceipt?`Forwarded · ${processorReceipt.office}`
-          :doc.processorName?.trim()&&doc.processorContactNumber?.trim()?"Forwarded · PRC":"",
+        label:processorReceipt?`Forwarded · ${getOfficeAcronym(processorReceipt.office)}`
+          :"",
         returnedOffice:null,
         received:false,
       };
@@ -2732,18 +3113,18 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
         ["CTO","CBO","CAO"].includes(visit.office)&&!!visit.received,
       )??getProcessorReceipt(latestRoute.forwarded);
       return {
-        label:`Forwarded · ${firstOfficeReceipt?.office??"PRC"}`,
+        label:`Forwarded · ${getOfficeAcronym(firstOfficeReceipt?.office??"PRC")}`,
         returnedOffice:null,
         received:!!firstOfficeReceipt,
       };
     }
     if (latestRoute.forwardedTo!=="CA") {
-      return { label:`Forwarded · ${latestRoute.forwardedTo}`, returnedOffice:null, received:false };
+      return { label:`Forwarded · ${getOfficeAcronym(latestRoute.forwardedTo)}`, returnedOffice:null, received:false };
     }
     const routeIndex=visits.indexOf(latestRoute);
     const received=visits.slice(routeIndex+1).some(visit=>visit.office==="CA"&&!!visit.received);
     return {
-      label:received?`Received · ${latestRoute.office}`:`Returned · ${latestRoute.office}`,
+      label:`${received?"Received":"Returned"} · ${getOfficeAcronym(latestRoute.office)}`,
       returnedOffice:latestRoute.office,
       received,
     };
@@ -2768,6 +3149,7 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
     return firstDispatch?.forwarded??groupDispatch?.forwarded??savedTimestamp;
   };
   const isSelectableForGroupForward=(doc:DocRecord)=>{
+    if (doc.source==="city-admin-correspondence") return false;
     const group=groupTrackingRecords.find(item=>item.documents.some(member=>member.id===doc.id));
     const trackingRecord=trackingRecords.find(record=>record.controlNo===doc.id);
     if (group||trackingRecord?.completedAt||getForwardedTimestamp(doc)||
@@ -2777,25 +3159,25 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
     return position.office==="CA"&&position.stage==="Received";
   };
   const getReturnedTimestamp=(doc:DocRecord)=>{
-    const visits=trackingRecords.find(item=>item.controlNo===doc.id)?.visits??[];
+    const record=trackingRecords.find(item=>item.controlNo===doc.id);
+    const visits=record?.visits??[];
     const group=groupTrackingRecords.find(item=>item.documents.some(member=>member.id===doc.id));
     const groupVisits=group?.visits??[];
     const returnReceipt=(journey:OfficeVisit[])=>{
-      const route=journey.find(visit=>visit.forwardedTo==="CA"&&!!visit.forwarded);
-      if (!route) return undefined;
-      return journey.slice(journey.lastIndexOf(route)+1).find(visit=>visit.office==="CA"&&!!visit.received);
+      const cityAdminDispatch=journey.findIndex(visit=>
+        visit.office==="CA"&&!!visit.forwarded&&!!visit.forwardedTo&&visit.forwardedTo!=="CA"
+      );
+      if (cityAdminDispatch<0) return undefined;
+      const returnRoute=journey.findIndex((visit,index)=>
+        index>cityAdminDispatch&&visit.forwardedTo==="CA"&&!!visit.forwarded
+      );
+      if (returnRoute<0) return undefined;
+      return journey.slice(returnRoute+1).find(visit=>visit.office==="CA"&&!!visit.received);
     };
+    const savedTimestamp=doc.dateReturned&&!doc.dateReturned.startsWith("0000-")?doc.dateReturned:"";
+    if (savedTimestamp) return savedTimestamp;
     const receipt=group?returnReceipt(groupVisits):returnReceipt(visits);
-    return receipt?.received??(doc.dateReturned&&!doc.dateReturned.startsWith("0000-")?doc.dateReturned:"");
-  };
-  const getFirstGroupReturnTimestamp=(doc:DocRecord)=>{
-    const group=groupTrackingRecords.find(item=>item.documents.some(member=>member.id===doc.id));
-    if (!group) return undefined;
-    const visits=group.visits??[];
-    const firstReturnRoute=visits.find(visit=>visit.forwardedTo==="CA"&&!!visit.forwarded);
-    if (!firstReturnRoute) return undefined;
-    return visits.slice(visits.indexOf(firstReturnRoute)+1)
-      .find(visit=>visit.office==="CA"&&!!visit.received)?.received;
+    return receipt?.received??"";
   };
   const forwardSelectedGroup=async()=>{
     if (!user||!forwardGroupOffice||selectedDocIds.length===0) return;
@@ -2814,7 +3196,13 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
       const response=await fetch('/api/group-forward.php',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({controlNos:ids,forwardedTo:forwardGroupOffice,actor,userId:user.id}),
+        body:JSON.stringify({
+          controlNos:ids,
+          office:getTrackingOfficeIdentifier(user.office),
+          forwardedTo:forwardGroupOffice,
+          actor,
+          userId:user.id,
+        }),
       });
       const payload=await response.json().catch(()=>null);
       if (!response.ok||!payload?.success) {
@@ -2837,7 +3225,12 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
         particulars:`${memberDocs.length} grouped documents`,
         type:memberDocs.length===1?memberDocs[0].type:"GROUP",
         initiatedAt:forwardedAt,
-        visits:[{office:"CA",forwarded:forwardedAt,forwardedTo:forwardGroupOffice,forwardedBy:actor}],
+        visits:[{
+          office:getTrackingOfficeIdentifier(user.office),
+          forwarded:forwardedAt,
+          forwardedTo:forwardGroupOffice,
+          forwardedBy:actor,
+        }],
         documents:memberDocs,
       };
       setGroupTrackingRecords(current=>[group,...current.filter(item=>item.groupId!==group.groupId)]);
@@ -2909,7 +3302,7 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
       setReceivingControlNo(null);
     }
   };
-  const applyOfficeRoute=(doc:DocRecord,office:string,forwardedBy:string)=>{
+  const applyOfficeRoute=(doc:DocRecord,office:string,forwardedBy:string,sourceOffice="CA")=>{
     const forwardedAt=nowTs();
     const previousVisits=trackingRecords.find(record=>record.controlNo===doc.id)?.visits??[];
     const firstDispatch=previousVisits.find(visit=>visit.office==="CA"&&["CTO","CBO","CAO"].includes(visit.forwardedTo??"")&&!!visit.forwarded);
@@ -2918,17 +3311,17 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
     setTracking(current=>{
       const existing=current.find(record=>record.controlNo===doc.id);
       const visits:OfficeVisit[]=existing?.visits?[...existing.visits]:existing?([
-        ...(["CTO","CBO","CAO"] as const).flatMap(office=>{
-          const step=existing[office.toLowerCase() as JourneyStepKey];
-          return step?[{office,...step}]:[];
+        ...(["CTO","CBO","CAO"] as const).flatMap(legacyOffice=>{
+          const step=existing[legacyOffice.toLowerCase() as JourneyStepKey];
+          return step?[{office:legacyOffice,...step}]:[];
         }),
         ...(existing.caReturn?[{office:"CA",...existing.caReturn}]:[]),
       ]):[];
       const last=visits[visits.length-1];
-      if (last?.office==="CA"&&last.received&&!last.forwarded) {
+      if (last?.office===sourceOffice&&last.received&&!last.forwarded) {
         visits[visits.length-1]={...last,forwarded:forwardedAt,forwardedTo:office,forwardedBy};
       } else {
-        visits.push({office:"CA",forwarded:forwardedAt,forwardedTo:office,forwardedBy});
+        visits.push({office:sourceOffice,forwarded:forwardedAt,forwardedTo:office,forwardedBy});
       }
       const updated:TrackingRecord=existing
         ?{...existing,visits}
@@ -2997,15 +3390,34 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
   };
 
   const filtered=docs.filter(d=>
-    (fOffice===""||d.office===fOffice)&&(fType===""||d.type===fType)&&
-    (fSignature===""||d.signature===fSignature)&&
-    (search===""||d.id.includes(search)||d.particulars.toLowerCase().includes(search.toLowerCase())||
+    (!isCityAdminViewer||fOffice===""||d.office===fOffice)&&getDocumentTypeGroup(d.type)===fType&&
+    (!isCityAdminViewer||fSignature===""||d.signature===fSignature)&&
+    (search===""||d.id.includes(search)||String(d.officeSequence??"").includes(search)||d.particulars.toLowerCase().includes(search.toLowerCase())||
+      (d.title??"").toLowerCase().includes(search.toLowerCase())||(d.to??"").toLowerCase().includes(search.toLowerCase())||
+      (d.from??"").toLowerCase().includes(search.toLowerCase())||(d.subject??"").toLowerCase().includes(search.toLowerCase())||
       d.office.toLowerCase().includes(search.toLowerCase()))
-  ).slice().sort((a,b)=>b.id.localeCompare(a.id));
+  ).slice().sort((a,b)=>{
+    const office=user?.office??"";
+    const controlNumberOrder=getDocumentDisplayNumber(b,office).localeCompare(
+      getDocumentDisplayNumber(a,office),
+      undefined,
+      {numeric:true,sensitivity:"base"},
+    );
+    if (controlNumberOrder!==0) return controlNumberOrder;
+    return (b.createdAt??b.date).localeCompare(a.createdAt??a.date)||b.id.localeCompare(a.id);
+  });
+  const correspondenceTable=fType==="correspondence";
   const selectableFiltered=filtered.filter(doc=>{
     return isSelectableForGroupForward(doc);
   });
   const selectableDocIds=new Set(selectableFiltered.map(doc=>doc.id));
+  const setDocumentTypeFilter=(nextType:"financial"|"correspondence")=>{
+    setFType(nextType);
+    if (nextType==="correspondence") {
+      setSelectingDocs(false);
+      setSelectedDocIds([]);
+    }
+  };
 
   useEffect(()=>{
     const eligibleIds=new Set(docs.filter(isSelectableForGroupForward).map(doc=>doc.id));
@@ -3017,11 +3429,98 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
 
   return (
     <div className="p-5">
+      {incomingTracking&&createPortal(
+        <div className="fixed inset-0 flex items-center justify-center p-4"
+          style={{ zIndex:1000, background:"rgba(0,0,0,0.65)", overflowY:"auto" }}
+          onClick={event=>event.target===event.currentTarget&&setIncomingTracking(null)}>
+          <div role="dialog" aria-modal="true" aria-labelledby="incoming-document-title"
+            className="rounded-2xl w-full max-w-3xl max-h-[calc(100dvh-2rem)] flex flex-col overflow-hidden modal-panel-enter"
+            style={{ background:C.card, border:`1px solid ${C.border}`, boxShadow:"0 24px 60px rgba(0,0,0,0.6)" }}>
+            <div className="flex flex-shrink-0 items-center justify-between px-6 py-4"
+              style={{ borderBottom:`1px solid ${C.border}` }}>
+              <div>
+                <p id="incoming-document-title" className="text-sm font-bold" style={{ color:C.text }}>
+                  {incomingTracking.source==="office"
+                    ?`Docs ID ${incomingTracking.controlNo}`
+                    :`Document ${incomingTracking.controlNo}`}
+                </p>
+                <p className="text-xs mt-0.5" style={{ color:C.muted }}>4-Office Journey Tracking</p>
+              </div>
+              <button type="button" onClick={()=>setIncomingTracking(null)} aria-label="Close document details"
+                className="text-xl" style={{ color:C.muted }}>×</button>
+            </div>
+            <div className="px-6 py-5 space-y-5 overflow-y-auto">
+              <div className="p-4 rounded-xl overflow-x-auto" style={{ background:C.card2 }}>
+                <div style={{ minWidth:420 }}><JourneyStepper record={incomingTracking}/></div>
+              </div>
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color:C.muted }}>Document Status</p>
+                <DocumentStatusCard record={incomingTracking}
+                  doc={docs.find(doc=>doc.id===incomingTracking.controlNo)} viewerOffice={user?.office}/>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                {(isOfficeCorrespondenceType(incomingTracking.type)
+                  ?[
+                    ["Date",incomingTracking.date],
+                    ["Title",incomingTracking.title],
+                    ["To",incomingTracking.to],
+                    ["From",incomingTracking.from],
+                    ["Subject",incomingTracking.subject],
+                  ]
+                  :[
+                    ["Date",incomingTracking.date],
+                    ["Payroll/Voucher",incomingTracking.payrollVoucher],
+                    ["Fund",incomingTracking.fund],
+                    ["Amount",incomingTracking.amount===null||incomingTracking.amount===undefined
+                      ?undefined:`₱${incomingTracking.amount.toLocaleString()}`],
+                  ]) .filter(([,value])=>!!value).map(([label,value])=>(
+                  <div key={label} className="rounded-lg p-2.5" style={{ background:C.card2 }}>
+                    <div className="text-xs mb-0.5" style={{ color:C.muted }}>{label}</div>
+                    <div className="text-xs font-semibold" style={{ color:C.text }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+              {getCurrentPosition(incomingTracking).office==="CA"&&
+                getCurrentPosition(incomingTracking).stage==="Awaiting Receipt"&&
+                role==="staff"&&isCityAdminViewer&&(
+                <div className="rounded-xl p-3 flex items-center gap-3"
+                  style={{ background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)" }}>
+                  <span className="text-lg">📬</span>
+                  <div className="flex-1">
+                    <p className="text-xs font-semibold" style={{ color:"#F59E0B" }}>Awaiting receipt at City Admin's Office</p>
+                    <p className="text-xs mt-0.5" style={{ color:C.muted }}>Confirm receipt to add this document to Document Entry.</p>
+                  </div>
+                  <button type="button" onClick={()=>setShowIncomingReceipt(true)}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold"
+                    style={{ background:"#10B981", color:"#fff" }}>Confirm Receipt</button>
+                </div>
+              )}
+              <div className="flex justify-end">
+                <Btn variant="ghost" onClick={()=>setIncomingTracking(null)}>Close</Btn>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+      {showIncomingReceipt&&incomingTracking&&(
+        <ConfirmActionModal action="receive" targetOffice="City Administrator's Office"
+          defaultActor={actor}
+          trackingDetails={{
+            controlNo:incomingTracking.cityAdminControlNo??incomingTracking.controlNo,
+            particulars:incomingTracking.particulars,
+            type:incomingTracking.type,
+            office:"City Administrator's Office",
+          }}
+          submitting={incomingReceiptSubmitting}
+          onConfirm={options=>void handleIncomingReceipt(options)}
+          onCancel={()=>setShowIncomingReceipt(false)}/>
+      )}
       {routeAgainDoc&&(
         <ModalOverlay onClose={()=>{setRouteAgainDoc(null);setRouteAgainOffice("");}}>
           <div className="text-sm font-bold mb-1" style={{ color:C.text }}>Continue Office Routing · #{routeAgainDoc.id}</div>
           <p className="text-xs mb-4" style={{ color:C.muted }}>Forward this completed entry to another office using the existing tracking number.</p>
-          <Field label="Next office"><TSelect options={["CTO","CBO","CAO"]} optionLabels={OFFICE_DISPLAY_NAME} value={routeAgainOffice} onChange={setRouteAgainOffice}/></Field>
+          <Field label="Next office"><TSelect options={getRoutingOfficeOptions(catalog.offices)} optionLabels={OFFICE_DISPLAY_NAME} value={routeAgainOffice} onChange={setRouteAgainOffice}/></Field>
           <div className="flex justify-end gap-2 mt-5">
             <Btn variant="ghost" onClick={()=>{setRouteAgainDoc(null);setRouteAgainOffice("");}}>Cancel</Btn>
             <Btn disabled={!routeAgainOffice||routeAgainLoading} onClick={()=>void handleRouteAgain()}>{routeAgainLoading?"Forwarding...":"Forward"}</Btn>
@@ -3034,7 +3533,7 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
           <p className="text-xs mb-4" style={{ color:C.muted }}>
             Forward all {routeAgainGroup.documents.length} documents together using their existing set tracking and SET QR code.
           </p>
-          <Field label="Next office"><TSelect options={["CTO","CBO","CAO"]} optionLabels={OFFICE_DISPLAY_NAME} value={routeAgainGroupOffice} onChange={setRouteAgainGroupOffice}/></Field>
+          <Field label="Next office"><TSelect options={getRoutingOfficeOptions(catalog.offices)} optionLabels={OFFICE_DISPLAY_NAME} value={routeAgainGroupOffice} onChange={setRouteAgainGroupOffice}/></Field>
           <div className="flex justify-end gap-2 mt-5">
             <Btn variant="ghost" disabled={routeAgainLoading} onClick={()=>{setRouteAgainGroup(null);setRouteAgainGroupOffice("");}}>Cancel</Btn>
             <Btn disabled={!routeAgainGroupOffice||routeAgainLoading||!actor} onClick={()=>void handleGroupRouteAgain()}>
@@ -3050,7 +3549,11 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
             {selectedDocIds.length} document{selectedDocIds.length===1?"":"s"} will share one tracking journey and QR code.
           </p>
           <Field label="Forward to">
-            <TSelect options={["CTO","CBO","CAO"]} value={forwardGroupOffice} onChange={setForwardGroupOffice}/>
+            <TSelect
+              options={getForwardDestinationOptions(catalog.offices,getTrackingOfficeIdentifier(user?.office??"CA")).filter(office=>office!=="PRC")}
+              optionLabels={OFFICE_DISPLAY_NAME}
+              value={forwardGroupOffice}
+              onChange={setForwardGroupOffice}/>
           </Field>
           <div className="flex justify-end gap-2 mt-5">
             <Btn variant="ghost" disabled={forwardingGroup} onClick={()=>setForwardGroupOffice("")}>Cancel</Btn>
@@ -3060,15 +3563,18 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
           </div>
         </ModalOverlay>
       )}
-      {showEntry&&user&&<DocEntryModal nextId={nextId} catalog={catalog} userId={user.id} onClose={()=>setShowEntry(false)} onSave={doc=>{
+      {showEntry&&user&&<DocEntryModal nextId={nextId} catalog={catalog} userId={user.id} userOffice={user.office} onClose={()=>setShowEntry(false)} onSave={doc=>{
         setDocs(p=>[doc,...p]);
       }}/ >}
-      {qrDoc&&<QrPrintModal doc={qrDoc} onClose={()=>setQrDoc(null)}/>}
+      {qrDoc&&<QrPrintModal doc={qrDoc} viewerOffice={user?.office} onClose={()=>setQrDoc(null)}/>}
       {groupQr&&<GroupQrModal group={groupQr} onClose={()=>setGroupQr(null)}/>}
-      {editDoc&&user&&<DocEditModal doc={editDoc} catalog={catalog} userId={user.id} canRoute forwardActor={actor}
+      {editDoc&&user&&<DocEditModal doc={editDoc} catalog={catalog} userId={user.id}
+        userOfficeName={user.office}
+        forwardingOffice={getTrackingOfficeIdentifier(user.office)}
+        canRoute={editDoc.source!=="city-admin-correspondence"} forwardActor={actor}
         detailsUnlocked={hasCityAdminReceipt(editDoc)}
         isGroupDocument={groupTrackingRecords.some(group=>group.documents.some(member=>member.id===editDoc.id))}
-        firstReturnAt={getFirstGroupReturnTimestamp(editDoc)}
+        firstReturnAt={getReturnedTimestamp(editDoc)}
         onClose={()=>setEditDoc(null)} onQrGenerate={handleQr} onViewTracking={onViewTracking}
         onSave={(u,forwardOffice)=>{
           setDocs(current=>current.map(item=>item.id===u.id?u:item));
@@ -3077,25 +3583,47 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
             documents:group.documents.map(member=>member.id===u.id?{...member,...u}:member),
           })));
           if (!forwardOffice) return;
-          if (actor) applyOfficeRoute(u,forwardOffice,actor);
+          if (actor) applyOfficeRoute(u,forwardOffice,actor,getTrackingOfficeIdentifier(user.office));
         }}/ >}
-      {detailDoc&&role==="admin"&&(
+      {detailDoc&&(
         <ModalOverlay onClose={()=>setDetailDoc(null)}>
-          <div className="text-sm font-bold mb-4" style={{ color:C.text }}>Document #{detailDoc.id} — Read Only</div>
+          <div className="text-sm font-bold mb-4" style={{ color:C.text }}>Document {getDocumentDisplayNumber(detailDoc,user?.office)} — Read Only</div>
           <div className="grid grid-cols-2 gap-3">
-            {([["Control No.","#"+detailDoc.id],["Date",fmtDate(detailDoc.date)],
-              ["Type",detailDoc.type],["Office",detailDoc.office],
-              ["Payroll/Voucher",detailDoc.payrollVoucher],["Particulars",detailDoc.particulars],
-              ["Fund",detailDoc.fund],["Amount","₱"+detailDoc.amount.toLocaleString()],
-              ["Signatory",detailDoc.signature],["Forwarded",detailDoc.dateForwarded],
-            ] as [string,string][]).map(([k,v])=>(
+            {((isOfficeCorrespondenceType(detailDoc.type)
+              ?[[detailNumberLabel,detailNumber],["Date",fmtDate(detailDoc.date)],
+                ["Type",detailDoc.type],["Office",detailDoc.office],["Title",detailDoc.title??""],
+                ["To",detailDoc.to??""],["From",detailDoc.from??""],["Subject",detailDoc.subject??""],
+                ["Signatory",detailDoc.signature],["Status",getDocumentLocationStatus(detailDoc)]]
+              :[[detailNumberLabel,detailNumber],["Date",fmtDate(detailDoc.date)],
+                ["Type",detailDoc.type],["Office",detailDoc.office],
+                ["Payroll/Voucher",detailDoc.payrollVoucher],["Particulars",detailDoc.particulars],
+                ["Fund",detailDoc.fund],["Amount","₱"+detailDoc.amount.toLocaleString()],
+                ["Signatory",detailDoc.signature],["Forwarded",detailDoc.dateForwarded],
+                ["Status",getDocumentLocationStatus(detailDoc)]]) as [string,string][]).map(([k,v])=>(
               <div key={k} className="rounded-lg p-3" style={{ background:C.card2 }}>
                 <div className="text-xs mb-1" style={{ color:C.muted }}>{k}</div>
                 <div className="text-xs font-semibold" style={{ color:C.text }}>{v}</div>
               </div>
             ))}
           </div>
-          <div className="mt-4 pt-4 flex justify-end" style={{ borderTop:`1px solid ${C.border}` }}>
+          {!isCityAdminViewer&&(
+            <div className="mt-4 rounded-xl border p-4 flex flex-col items-center gap-2"
+              style={{ borderColor:C.border, background:C.card2 }}>
+              <p className="text-xs font-semibold" style={{ color:C.text }}>Document QR Code</p>
+              <div className="rounded-lg bg-white p-3">
+                <QRCodeSVG value={getProcessorDocumentUrl(detailDoc.id)} size={144}
+                  bgColor="#ffffff" fgColor="#0D1021" level="M"/>
+              </div>
+              <p className="text-xs" style={{ color:C.muted }}>Docs ID {detailDoc.id}</p>
+            </div>
+          )}
+          <div className="mt-4 pt-4 flex justify-between gap-3" style={{ borderTop:`1px solid ${C.border}` }}>
+            {!isCityAdminViewer&&onViewTracking&&(
+              <Btn onClick={()=>{
+                onViewTracking(detailDoc.id);
+                setDetailDoc(null);
+              }}>View Tracking Journey</Btn>
+            )}
             <Btn variant="ghost" onClick={()=>setDetailDoc(null)}>Close</Btn>
           </div>
         </ModalOverlay>
@@ -3107,10 +3635,14 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
           {role==="admin"&&<span className="text-xs px-2 py-0.5 rounded"
             style={{ background:"rgba(59,130,246,0.15)", color:C.blue }}>View Only</span>}
         </div>
-        {role==="staff"&&<Btn size="large" disabled={!catalog.types.length||!catalog.offices.length||!catalog.funds.length||!catalog.signatures.length}
+        {role==="staff"&&isCityAdminViewer&&<Btn size="large" disabled={!catalog.types.length||!catalog.offices.length||!catalog.funds.length||!catalog.signatures.length}
           onClick={()=>setShowEntry(true)}>+ Add New Document</Btn>}
-        {role==="staff"&&(!catalog.types.length||!catalog.offices.length||!catalog.funds.length||!catalog.signatures.length)&&(
-          <p className="text-xs" style={{ color:C.muted }}>Document types, offices, funds, and signatories must be configured in the database before adding documents.</p>
+        {role==="staff"&&(isCityAdminViewer
+          ?!catalog.types.length||!catalog.offices.length||!catalog.funds.length||!catalog.signatures.length
+          :!catalog.types.length||(fType==="financial"&&!catalog.funds.length))&&(
+          <p className="text-xs" style={{ color:C.muted }}>{isCityAdminViewer
+            ?"Document types, offices, funds, and signatories must be configured in the database before adding documents."
+            :"Document types and funds must be configured before adding financial documents."}</p>
         )}
       </div>
 
@@ -3122,9 +3654,10 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
             placeholder="Search…" className="text-sm bg-transparent outline-none w-36"
             style={{ color:C.text }}/>
         </div>
-        {[{ label:"Office",val:fOffice,set:setFOffice,opts:catalog.offices },
-          { label:"Type",  val:fType,  set:setFType,  opts:catalog.types },
-          { label:"Signatory",val:fSignature,set:setFSignature,opts:catalog.signatures }].map(f=>(
+        {(isCityAdminViewer
+          ?[{ label:"Office",val:fOffice,set:setFOffice,opts:catalog.offices },
+            { label:"Signatory",val:fSignature,set:setFSignature,opts:catalog.signatures }]
+          :[]).map(f=>(
           <select key={f.label} value={f.val} onChange={e=>f.set(e.target.value)}
             className="rounded-lg px-3 py-2.5 text-sm border outline-none"
             style={{ background:C.card2, borderColor:C.border, color:f.val?C.text:C.muted }}>
@@ -3132,17 +3665,36 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
             {f.opts.map(o=><option key={o}>{o}</option>)}
           </select>
         ))}
-        {role==="staff"&&(
-          <div className="flex items-center gap-2">
-            <Btn size="large" variant={selectingDocs?"ghost":"primary"} onClick={()=>{
-              setSelectingDocs(value=>!value);
-              setSelectedDocIds([]);
-            }}>{selectingDocs?"Cancel selection":"Select docs"}</Btn>
-            {selectingDocs&&selectedDocIds.length>0&&(
-              <Btn size="large" onClick={()=>setForwardGroupOffice("CTO")}>Forward selected docs ({selectedDocIds.length})</Btn>
-            )}
+        {isCityAdminViewer?(
+          <select value={fType} onChange={event=>
+            setDocumentTypeFilter(event.target.value as "financial"|"correspondence")}
+            className="rounded-lg px-3 py-2.5 text-sm border outline-none"
+            style={{ background:C.card2, borderColor:C.border, color:C.text }}>
+            <option value="financial">DV/PAYROLL</option>
+            <option value="correspondence">MEMO/LETTER</option>
+          </select>
+        ):(
+          <div className="inline-flex rounded-lg border p-1" role="group" aria-label="Document type"
+            style={{ background:C.card2,borderColor:C.border }}>
+            {([
+              ["financial","DV/PAYROLL"],
+              ["correspondence","MEMO/LETTER"],
+            ] as const).map(([type,label])=>{
+              const active=fType===type;
+              return (
+                <button key={type} type="button" aria-pressed={active}
+                  onClick={()=>setDocumentTypeFilter(type)}
+                  className="rounded-md px-3 py-2 text-sm font-medium transition-colors"
+                  style={{ background:active?C.purple:"transparent",color:active?"#fff":C.sub }}>
+                  {label}
+                </button>
+              );
+            })}
           </div>
         )}
+        {role==="staff"&&!isCityAdminViewer&&<Btn size="large"
+          disabled={!catalog.types.length||(fType==="financial"&&!catalog.funds.length)}
+          onClick={()=>setShowEntry(true)}>+ Add New Document</Btn>}
         <span className="text-sm ml-auto" style={{ color:C.muted }}>{filtered.length} records</span>
       </div>
 
@@ -3151,16 +3703,15 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
           <table className="w-full min-w-max">
             <thead>
               <tr style={{ background:LT.headerBg }}>
-                {selectingDocs&&<th className="px-3 py-2.5">
-                  <input type="checkbox" aria-label="Select all visible documents"
-                    checked={selectableFiltered.length>0&&selectableFiltered.every(doc=>selectedDocIds.includes(doc.id))}
-                    onChange={event=>setSelectedDocIds(event.target.checked
-                      ?Array.from(new Set([...selectedDocIds,...selectableFiltered.map(doc=>doc.id)]))
-                      :selectedDocIds.filter(id=>!selectableFiltered.some(doc=>doc.id===id)))}
-                    onClick={event=>event.stopPropagation()}/>
-                </th>}
-                {["Control No.","Date","Type","Office","Payroll/Voucher","Particular/Details","Fund","Amount","Signature","Date Forwarded","Cheque No.","Date Fwd. (Returned)","Type","P.R. No.",
-                  ...(role==="staff"?["QR Generated/Received","Office forward"]:[])].map(h=>(
+                {[
+                  documentNumberLabel,"Date","Type","Office",
+                  ...(correspondenceTable
+                    ?["Title","To","From","Subject","Date Forwarded","Signature"]
+                    :["Payroll/Voucher","Particular/Details","Fund","Amount","Signature",
+                      ...(isCityAdminViewer?["Date Forwarded"]:[]),"Cheque No.",...(isCityAdminViewer?["Date Fwd. (Returned)"]:[]),"Type","P.R. No.",
+                      ...(role==="staff"&&isCityAdminViewer?["QR Generated/Received","Office forward"]:[])]),
+                  ...(!isCityAdminViewer?["Status"]:[]),
+                ].map(h=>(
                   <th key={h} className="text-left px-3 py-2.5 text-[11px] font-bold whitespace-nowrap"
                     style={{ color:LT.headerText, borderBottom:"2px solid rgba(108,79,245,0.4)" }}>{h}</th>
                 ))}
@@ -3177,35 +3728,45 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
                 const firstVisibleGroupMember=visibleGroupDocs[0]?.id===doc.id;
                 const groupReturn=group?getGroupReturnInfo(group):null;
                 return (
-                <tr key={doc.id} className={role==="admin"||(role==="staff"&&canEditDoc(doc))?"cursor-pointer":""}
+                <tr key={doc.id} className={role==="admin"||role==="staff"?"cursor-pointer":""}
                   style={{ background:group&&hoveredGroupQrId===group.groupId?"rgba(59,130,246,0.08)":i%2===0?LT.rowBg:LT.rowAltBg, borderBottom:`1px solid ${LT.rowBorder}` }}
                   onMouseEnter={e=>(e.currentTarget.style.background=group&&hoveredGroupQrId===group.groupId?"rgba(59,130,246,0.08)":isDark?C.card2:"#EEF2FF")}
                   onMouseLeave={e=>(e.currentTarget.style.background=group&&hoveredGroupQrId===group.groupId?"rgba(59,130,246,0.08)":i%2===0?LT.rowBg:LT.rowAltBg)}
-                  onClick={()=>!selectingDocs&&(role==="admin"?setDetailDoc(doc):role==="staff"&&canEditDoc(doc)&&setEditDoc(doc))}>
-                  {selectingDocs&&!group&&selectableDocIds.has(doc.id)&&<td className="px-3 py-2.5" onClick={event=>event.stopPropagation()}>
-                    <input type="checkbox" aria-label={`Select document ${doc.id}`}
-                      checked={selectedDocIds.includes(doc.id)}
-                      onChange={event=>setSelectedDocIds(current=>event.target.checked
-                        ?[...current,doc.id]
-                        :current.filter(id=>id!==doc.id))}/>
-                  </td>}
-                  {selectingDocs&&!group&&!selectableDocIds.has(doc.id)&&<td className="px-3 py-2.5"/>}
-                  {selectingDocs&&group&&<td className="px-3 py-2.5"/>}
-                  <td className="px-3 py-2.5 text-[11px] font-bold whitespace-nowrap" style={{ color:LT.link }}>#{doc.id}</td>
-                  <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>{doc.createdAt?fmtLocalDateTime(doc.createdAt):fmtDate(doc.date)}</td>
+                  onClick={()=>role==="admin"?setDetailDoc(doc):role==="staff"?
+                    canEditDoc(doc)?setEditDoc(doc):setDetailDoc(doc):undefined}>
+                  <td className="px-3 py-2.5 text-[11px] font-bold whitespace-nowrap" style={{ color:LT.link }}>
+                    {getDocumentDisplayNumber(doc,user?.office)}
+                  </td>
+                  <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>
+                    {isOfficeCorrespondenceType(doc.type)
+                      ?fmtDate(doc.date)
+                      :doc.createdAt?fmtLocalDateTime(doc.createdAt):fmtDate(doc.date)}
+                  </td>
                   <td className="px-3 py-2.5 text-[11px] font-semibold" style={{ color:LT.text }}>{doc.type}</td>
                   <td className="px-3 py-2.5 text-[11px] font-semibold" style={{ color:LT.sub }}>{doc.office}</td>
+                  {correspondenceTable?<>
+                    <td className="px-3 py-2.5 text-[11px] max-w-[220px] truncate" style={{ color:LT.sub }}>{doc.title}</td>
+                    <td className="px-3 py-2.5 text-[11px] max-w-[200px] truncate" style={{ color:LT.sub }}>{doc.to}</td>
+                    <td className="px-3 py-2.5 text-[11px] max-w-[200px] truncate" style={{ color:LT.sub }}>{doc.from}</td>
+                    <td className="px-3 py-2.5 text-[11px] max-w-[300px] truncate" style={{ color:LT.sub }}>{doc.subject}</td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>
+                      {doc.dateForwarded&&!doc.dateForwarded.startsWith("0000-")?fmtLocalDateTime(doc.dateForwarded):""}
+                    </td>
+                    <td className="px-3 py-2.5 text-[11px] whitespace-nowrap" style={{ color:LT.sub }}>{doc.signature.split(" – ")[0]}</td>
+                  </>:<>
                   <td className="px-3 py-2.5 text-[11px] max-w-[120px] truncate" style={{ color:LT.sub }}>{doc.payrollVoucher}</td>
                   <td className="px-3 py-2.5 text-[11px] max-w-[120px] truncate" style={{ color:LT.sub }}>{doc.particulars}</td>
                   <td className="px-3 py-2.5 text-[11px] whitespace-nowrap" style={{ color:LT.sub }}>{doc.fund}</td>
-                  <td className="px-3 py-2.5 text-[11px] whitespace-nowrap font-semibold" style={{ color:LT.text }}>₱{doc.amount.toLocaleString()}</td>
+                  <td className="px-3 py-2.5 text-[11px] whitespace-nowrap font-semibold" style={{ color:LT.text }}>
+                    {doc.source==="office"&&isOfficeCorrespondenceType(doc.type)?"":`₱${doc.amount.toLocaleString()}`}
+                  </td>
                   <td className="px-3 py-2.5 text-[11px] whitespace-nowrap" style={{ color:LT.sub }}>{doc.signature.split(" – ")[0]}</td>
-                  <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>{getForwardedTimestamp(doc)?fmtLocalDateTime(getForwardedTimestamp(doc)):""}</td>
+                  {isCityAdminViewer&&<td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>{getForwardedTimestamp(doc)?fmtLocalDateTime(getForwardedTimestamp(doc)):""}</td>}
                   <td className="px-3 py-2.5 text-xs whitespace-nowrap font-medium" style={{ color:LT.text }}>{doc.chequeNo??""}</td>
-                  <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>{getReturnedTimestamp(doc)?fmtLocalDateTime(getReturnedTimestamp(doc)):""}</td>
+                  {isCityAdminViewer&&<td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>{getReturnedTimestamp(doc)?fmtLocalDateTime(getReturnedTimestamp(doc)):""}</td>}
                   <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.sub }}>{doc.subType??""}</td>
                   <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.muted }}>{doc.prNumber??""}</td>
-                  {role==="staff"&&(group
+                  {role==="staff"&&isCityAdminViewer&&(group
                     ?firstVisibleGroupMember&&<td rowSpan={visibleGroupDocs.length}
                       className="px-3 py-2.5 align-middle" onClick={event=>event.stopPropagation()}>
                       <div className="flex w-fit items-center justify-center gap-2">
@@ -3238,7 +3799,7 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
                                 className="rounded-md border px-2.5 py-1.5 text-[11px] font-semibold whitespace-nowrap disabled:opacity-60"
                                 style={{ borderColor:`${C.purple}66`, background:`${C.purple}12`, color:C.purple }}
                                 title={`Receive returned group from ${groupReturn.returnedOffice}`}>
-                                {receivingControlNo===group.startControlNo?"Receiving…":`Receive · ${groupReturn.returnedOffice}`}
+                                {receivingControlNo===group.startControlNo?"Receiving…":`Receive · ${getOfficeAcronym(groupReturn.returnedOffice)}`}
                               </button>
                             )}
                           </>
@@ -3260,7 +3821,7 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
                           className="rounded-md border px-2.5 py-1.5 text-[11px] font-semibold whitespace-nowrap disabled:opacity-60"
                           style={{ borderColor:`${C.purple}66`, background:`${C.purple}12`, color:C.purple }}
                           title={`Receive returned document from ${route.returnedOffice}`}>
-                          {receivingControlNo===doc.id?"Receiving…":`Receive · ${route.returnedOffice}`}
+                          {receivingControlNo===doc.id?"Receiving…":`Receive · ${getOfficeAcronym(route.returnedOffice)}`}
                         </button>
                       ):route.label?(
                         <button type="button" onClick={()=>{handleQr(doc.id);setQrDoc(doc);}}
@@ -3283,7 +3844,7 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
                       {(()=>{
                         const allCompleted=group.documents.length>0&&group.documents.every(member=>
                           docs.some(item=>item.id===member.id&&!!getForwardedTimestamp(item)&&
-                            hasCompleteDocumentDetails(item,hasCityAdminReceipt(item)))
+                            hasCompleteDocumentDetails(item,hasCityAdminReceipt(item),isCityAdminViewer&&hasCityAdminReceipt(item)))
                         );
                         return isTrackingComplete?(
                           <span className="text-[11px] font-semibold whitespace-nowrap" style={{ color:C.green }}>
@@ -3298,12 +3859,13 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
                         ):null;
                       })()}
                     </td>
-                    :role==="staff"&&<td className="px-3 py-2.5 text-center" onClick={event=>event.stopPropagation()}>
+                    :role==="staff"&&isCityAdminViewer&&<td className="px-3 py-2.5 text-center" onClick={event=>event.stopPropagation()}>
                       {isTrackingComplete?(
                         <span className="text-[11px] font-semibold whitespace-nowrap" style={{ color:C.green }}>
                           Completed
                         </span>
-                      ):role==="staff"&&!!getForwardedTimestamp(doc)&&hasCompleteDocumentDetails(doc,hasCityAdminReceipt(doc))&&
+                      ):role==="staff"&&!!getForwardedTimestamp(doc)&&
+                        hasCompleteDocumentDetails(doc,hasCityAdminReceipt(doc),isCityAdminViewer&&hasCityAdminReceipt(doc))&&
                         hasCityAdminReceipt(doc)&&canEditDoc(doc)?(
                         <button onClick={()=>{setRouteAgainDoc(doc);setRouteAgainOffice("");}}
                           className="rounded-md border px-2.5 py-1.5 text-[11px] font-semibold whitespace-nowrap"
@@ -3312,10 +3874,14 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
                         </button>
                       ):null}
                     </td>}
+                  </>}
+                  {!isCityAdminViewer&&<td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color:LT.sub }}>
+                    {getDocumentLocationStatus(doc)}
+                  </td>}
                 </tr>
               )})}
               {filtered.length===0&&(
-                <tr><td colSpan={14+(role==="staff"?2:0)+(selectingDocs?1:0)} className="py-10 text-center text-xs"
+                <tr><td colSpan={(selectingDocs?1:0)+(correspondenceTable?10+(isCityAdminViewer?0:1):12+(isCityAdminViewer?3:0)+(role==="staff"&&isCityAdminViewer?2:0))} className="py-10 text-center text-xs"
                   style={{ background:LT.rowBg, color:LT.muted }}>No documents match the current filters.</td></tr>
               )}
             </tbody>
@@ -3331,22 +3897,28 @@ function DocumentTracker({ role, user, docs, trackingRecords, groupTrackingRecor
 
 // ─── TRACKING MONITORING ─────────────────────────────────────────────────────
 
-function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTrackingRecords, setGroupTrackingRecords, docs, setDocs, role, user, onViewDocument, initialTrackingId, onInitialTrackingHandled }:{
+function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTrackingRecords, setGroupTrackingRecords, docs, setDocs, role, user, catalog, onViewDocument, initialTrackingId, onInitialTrackingHandled }:{
   trackingRecords:TrackingRecord[];
   setTrackingRecords:React.Dispatch<React.SetStateAction<TrackingRecord[]>>;
   groupTrackingRecords:GroupTrackingRecord[];
   setGroupTrackingRecords:React.Dispatch<React.SetStateAction<GroupTrackingRecord[]>>;
   docs:DocRecord[]; setDocs:React.Dispatch<React.SetStateAction<DocRecord[]>>; role:Role; user:AuthUser|null; onViewDocument:(id:string)=>void; initialTrackingId?:string;
+  catalog:CatalogData;
   onInitialTrackingHandled?:()=>void;
 }) {
   const C=useC();
   const actor=getTrackingActor(user);
+  const isCityAdminViewer=isCityAdminOffice(user?.office??"");
+  const assignedOffice=getTrackingOfficeIdentifier(user?.office??"");
   const [filterOffice,setFilterOffice]=useState(""), [filterStage,setFilterStage]=useState("");
   const [selected,setSelected]=useState<TrackingRecord|null>(null);
   const [selectedGroup,setSelectedGroup]=useState<GroupTrackingRecord|null>(null);
   const [selectedGroupDocument,setSelectedGroupDocument]=useState<DocRecord|null>(null);
   const [trackingView,setTrackingView]=useState<"single"|"group">("single");
   const [showReceive,setShowReceive]=useState(false);
+  const [receiptSubmitting,setReceiptSubmitting]=useState(false);
+  const [showOfficeReceive,setShowOfficeReceive]=useState(false);
+  const [showOfficeForSig,setShowOfficeForSig]=useState(false);
   const [showSingleComplete,setShowSingleComplete]=useState(false);
   const [singleCompleteSubmitting,setSingleCompleteSubmitting]=useState(false);
   const [showGroupReceive,setShowGroupReceive]=useState(false), [showGroupForward,setShowGroupForward]=useState(false);
@@ -3356,8 +3928,26 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
     const group=groupTrackingRecords.find(record=>record.controlNo===initialTrackingId||
       record.documents.some(document=>document.id===initialTrackingId));
     if (group) {
-      setTrackingView("group");
-      setSelectedGroup(group);
+      if (isCityAdminViewer) {
+        setTrackingView("group");
+        setSelectedGroup(group);
+      } else {
+        const documentId=group.documents.find(document=>document.id===initialTrackingId)?.id??
+          group.documents[0]?.id;
+        const individualTracking=documentId
+          ?trackingRecords.find(record=>record.controlNo===documentId)??{
+            ...group,
+            id:`${group.id}-${documentId}`,
+            controlNo:documentId,
+            particulars:group.documents.find(document=>document.id===documentId)?.particulars??group.particulars,
+            type:group.documents.find(document=>document.id===documentId)?.type??group.type,
+          }
+          :undefined;
+        if (individualTracking) {
+          setTrackingView("single");
+          setSelected(individualTracking);
+        }
+      }
       onInitialTrackingHandled?.();
       return;
     }
@@ -3367,7 +3957,7 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
       setSelected(target);
       onInitialTrackingHandled?.();
     }
-  },[initialTrackingId,onInitialTrackingHandled,trackingRecords,groupTrackingRecords]);
+  },[initialTrackingId,isCityAdminViewer,onInitialTrackingHandled,trackingRecords,groupTrackingRecords]);
 
   const STAGE_CFG:Record<string,{color:string;bg:string}>={
     "Awaiting Receipt":{ color:"#F59E0B", bg:"rgba(245,158,11,0.12)" },
@@ -3376,11 +3966,16 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
     "Complete":        { color:"#10B981", bg:"rgba(16,185,129,0.12)" },
   };
 
-  const filtered=trackingRecords.filter(r=>{
+  const trackingRecordsForViewer=isCityAdminViewer
+    ?trackingRecords
+    :trackingRecords.filter(record=>
+      getTrackingOfficeIdentifier(record.originOffice??"")===assignedOffice
+    );
+  const filtered=trackingRecordsForViewer.filter(r=>{
     const pos=getCurrentPosition(r);
     return (filterOffice===""||pos.office===filterOffice)&&(filterStage===""||pos.stage===filterStage);
   }).sort((left,right)=>getLatestTrackingActivityTime(right)-getLatestTrackingActivityTime(left));
-  const filteredGroups=groupTrackingRecords.filter(record=>{
+  const filteredGroups=(isCityAdminViewer?groupTrackingRecords:[]).filter(record=>{
     const pos=getCurrentPosition(record);
     return (filterOffice===""||pos.office===filterOffice)&&(filterStage===""||pos.stage===filterStage);
   }).sort((left,right)=>getLatestTrackingActivityTime(right)-getLatestTrackingActivityTime(left));
@@ -3429,6 +4024,7 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
   const handleCAReceipt=async(opts:{forwardedBy:string})=>{
     if (!selected) return;
     if (!actor) { alert("Add your 11-digit contact number in your profile before confirming receipt."); return; }
+    setReceiptSubmitting(true);
     try {
       const response=await fetch('/api/tracking-update.php',{
         method:'POST',
@@ -3453,8 +4049,59 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
         :doc));
       setShowReceive(false);
       setSelected(null);
+      try {
+        const [docsResponse,trackingResponse]=await Promise.all([
+          fetch('/api/docs.php',{cache:'no-store'}),
+          fetch('/api/tracking.php',{cache:'no-store'}),
+        ]);
+        const [docsPayload,trackingPayload]=await Promise.all([
+          docsResponse.json().catch(()=>null),
+          trackingResponse.json().catch(()=>null),
+        ]);
+        if (!docsResponse.ok||!docsPayload?.success) {
+          throw new Error(docsPayload?.message??`Document list refresh failed (${docsResponse.status})`);
+        }
+        if (!trackingResponse.ok||!trackingPayload?.success) {
+          throw new Error(trackingPayload?.message??`Tracking refresh failed (${trackingResponse.status})`);
+        }
+        setDocs(docsPayload.docs??[]);
+        setTrackingRecords(trackingPayload.tracking??[]);
+      } catch(error) {
+        alert(`Receipt was confirmed, but the document list could not be refreshed. Reload the page to see it. ${error instanceof Error?error.message:""}`);
+      }
     } catch(error) {
       alert(error instanceof Error?error.message:"Unable to confirm document receipt.");
+    } finally {
+      setReceiptSubmitting(false);
+    }
+  };
+  const handleAssignedOfficeTrackingAction=async(action:"receive"|"forSig",opts:{forwardedBy:string})=>{
+    if (!selected||isCityAdminViewer) return;
+    try {
+      const response=await fetch('/api/tracking-update.php',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          controlNo:selected.controlNo,office:assignedOffice,action,actor:opts.forwardedBy,
+        }),
+      });
+      const payload=await response.json().catch(()=>null);
+      if (!response.ok||!payload?.success) {
+        throw new Error(payload?.message??`Tracking update failed (${response.status})`);
+      }
+      const trackingResponse=await fetch('/api/tracking.php',{cache:'no-store'});
+      const trackingPayload=await trackingResponse.json().catch(()=>null);
+      if (!trackingResponse.ok||!trackingPayload?.success) {
+        throw new Error(trackingPayload?.message??`Tracking was updated, but it could not be refreshed (${trackingResponse.status})`);
+      }
+      const refreshed:TrackingRecord[]=trackingPayload.tracking??[];
+      setTrackingRecords(refreshed);
+      const updated=refreshed.find(record=>record.controlNo===selected.controlNo);
+      if (updated) setSelected(updated);
+      setShowOfficeReceive(false);
+      setShowOfficeForSig(false);
+    } catch(error) {
+      alert(error instanceof Error?error.message:"Unable to update document tracking.");
     }
   };
   const handleSingleComplete=async(opts:{forwardedBy:string})=>{
@@ -3504,7 +4151,24 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
       {showReceive&&selected&&(
         <ConfirmActionModal action="receive" targetOffice="City Administrator's Office"
           defaultActor={actor}
+          trackingDetails={selected.source==="office"?{
+            controlNo:selected.cityAdminControlNo??selected.controlNo,
+            particulars:selected.particulars,
+            type:selected.type,
+            office:"City Administrator's Office",
+          }:undefined}
+          submitting={receiptSubmitting}
           onConfirm={handleCAReceipt} onCancel={()=>setShowReceive(false)}/>
+      )}
+      {showOfficeReceive&&selected&&(
+        <ConfirmActionModal action="receive" targetOffice={user?.office??assignedOffice}
+          defaultActor={actor}
+          onConfirm={opts=>handleAssignedOfficeTrackingAction("receive",opts)} onCancel={()=>setShowOfficeReceive(false)}/>
+      )}
+      {showOfficeForSig&&selected&&(
+        <ConfirmActionModal action="forSig" targetOffice={user?.office??assignedOffice}
+          defaultActor={actor}
+          onConfirm={opts=>handleAssignedOfficeTrackingAction("forSig",opts)} onCancel={()=>setShowOfficeForSig(false)}/>
       )}
       {showGroupReceive&&selectedGroup&&(
         <ConfirmActionModal action="receive" targetOffice="City Administrator's Office · Group"
@@ -3514,7 +4178,7 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
       )}
       {showGroupForward&&selectedGroup&&(
         <ConfirmActionModal action="forward" targetOffice="Forward Group from City Admin"
-          nextOffices={["CTO","CBO","CAO"]}
+          nextOffices={getRoutingOfficeOptions(catalog.offices)}
           defaultActor={actor}
           onConfirm={options=>void handleGroupAction("dispatch",{forwardDest:options.forwardDest,forwardedBy:actor})}
           onCancel={()=>setShowGroupForward(false)}/>
@@ -3529,7 +4193,11 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
             <div className="flex flex-shrink-0 items-center justify-between px-6 py-4"
               style={{ borderBottom:`1px solid ${C.border}` }}>
               <div>
-                <p id="tracking-dialog-title" className="text-sm font-bold" style={{ color:C.text }}>Document #{selected.controlNo}</p>
+                <p id="tracking-dialog-title" className="text-sm font-bold" style={{ color:C.text }}>
+                  {selected.source==="office"
+                    ?`Docs ID ${selected.controlNo}`
+                    :`Document ${selected.controlNo}`}
+                </p>
                 <p className="text-xs mt-0.5" style={{ color:C.muted }}>4-Office Journey Tracking</p>
               </div>
               <button onClick={()=>setSelected(null)} aria-label="Close document details" className="text-xl" style={{ color:C.muted }}>×</button>
@@ -3542,11 +4210,35 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
               </div>
               <div>
                 <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color:C.muted }}>Document Status</p>
-                <DocumentStatusCard record={selected} doc={docs.find(d=>d.id===selected.controlNo)}/>
+                <DocumentStatusCard record={selected} doc={docs.find(d=>d.id===selected.controlNo)}
+                  viewerOffice={user?.office}/>
               </div>
+              {selected.source==="office"&&(
+                <div className="grid grid-cols-2 gap-3">
+                  {(isOfficeCorrespondenceType(selected.type)
+                    ?[
+                    ["Title",selected.title],
+                    ["To",selected.to],
+                    ["From",selected.from],
+                    ["Date",selected.date],
+                    ["Subject",selected.subject],
+                    ]
+                    :[
+                    ["Date",selected.date],
+                    ["Payroll/Voucher",selected.payrollVoucher],
+                    ["Fund",selected.fund],
+                    ["Amount",selected.amount===null||selected.amount===undefined?undefined:`₱${selected.amount.toLocaleString()}`],
+                    ]).filter(([,value])=>!!value).map(([label,value])=>(
+                    <div key={label} className="rounded-lg p-2.5" style={{ background:C.card2 }}>
+                      <div className="text-xs mb-0.5" style={{ color:C.muted }}>{label}</div>
+                      <div className="text-xs font-semibold" style={{ color:C.text }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
               {(()=>{
                 const doc=docs.find(d=>d.id===selected.controlNo);
-                if (!doc) return null;
+                if (!doc||isOfficeCorrespondenceType(doc.type)) return null;
                 return (
                   <div className="grid grid-cols-2 gap-3">
                     {([["Payroll/Voucher",doc.payrollVoucher],["Fund",doc.fund],
@@ -3562,13 +4254,45 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
               })()}
               {(()=>{
                 const pos=getCurrentPosition(selected);
-                if (pos.office==="CA"&&pos.stage==="Awaiting Receipt") return (
+                if (!isCityAdminViewer&&selected.source&&pos.office===assignedOffice&&pos.stage==="Awaiting Receipt") return (
+                  <div className="rounded-xl p-3 flex items-center gap-3"
+                    style={{ background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)" }}>
+                    <span className="text-lg">📬</span>
+                    <div className="flex-1">
+                      <p className="text-xs font-semibold" style={{ color:"#F59E0B" }}>Awaiting receipt at {user?.office}</p>
+                      <p className="text-xs mt-0.5" style={{ color:C.muted }}>Confirm receipt to continue this document's tracking.</p>
+                    </div>
+                    {role==="staff"&&(
+                      <button onClick={()=>setShowOfficeReceive(true)}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold"
+                        style={{ background:"#10B981", color:"#fff" }}>Confirm Receipt</button>
+                    )}
+                  </div>
+                );
+                if (!isCityAdminViewer&&selected.source&&pos.office===assignedOffice&&pos.stage==="Received") return (
+                  <div className="rounded-xl p-3 flex items-center gap-3"
+                    style={{ background:"rgba(16,185,129,0.1)", border:"1px solid rgba(16,185,129,0.3)" }}>
+                    <span className="text-lg">✍️</span>
+                    <div className="flex-1">
+                      <p className="text-xs font-semibold" style={{ color:"#10B981" }}>Received at {user?.office}</p>
+                      <p className="text-xs mt-0.5" style={{ color:C.muted }}>Mark the document for signature before forwarding.</p>
+                    </div>
+                    {role==="staff"&&(
+                      <button onClick={()=>setShowOfficeForSig(true)}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold"
+                        style={{ background:"#6C4FF5", color:"#fff" }}>Mark For Signature</button>
+                    )}
+                  </div>
+                );
+                if (isCityAdminViewer&&pos.office==="CA"&&pos.stage==="Awaiting Receipt") return (
                   <div className="rounded-xl p-3 flex items-center gap-3"
                     style={{ background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)" }}>
                     <span className="text-lg">📬</span>
                     <div className="flex-1">
                       <p className="text-xs font-semibold" style={{ color:"#F59E0B" }}>Awaiting receipt at City Admin's Office</p>
-                      <p className="text-xs mt-0.5" style={{ color:C.muted }}>CAO has forwarded this document back.</p>
+                      <p className="text-xs mt-0.5" style={{ color:C.muted }}>
+                        {selected.source==="office"?"This document was forwarded to City Admin's Office.":"CAO has forwarded this document back."}
+                      </p>
                     </div>
                     {role==="staff"&&(
                       <button onClick={()=>setShowReceive(true)}
@@ -3579,7 +4303,7 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
                 );
                 return null;
               })()}
-              {role==="staff"&&getCurrentPosition(selected).office==="CA"&&
+              {isCityAdminViewer&&role==="staff"&&getCurrentPosition(selected).office==="CA"&&
                 getCurrentPosition(selected).stage==="Received"&&!selected.completedAt&&(
                 <div className="flex justify-end">
                   <Btn variant="success" onClick={()=>setShowSingleComplete(true)}>Complete Tracking</Btn>
@@ -3593,11 +4317,14 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
                 </div>
               )}
               <div className="flex items-center justify-between">
-                <button onClick={()=>{ onViewDocument(selected.controlNo); setSelected(null); }}
-                  className="px-3 py-1.5 rounded-lg text-xs font-semibold border"
-                  style={{ borderColor:C.border, color:C.purple, background:`${C.purple}12` }}>
-                  View Document
-                </button>
+                {!(selected.source==="office"&&getCurrentPosition(selected).office==="CA"&&
+                  getCurrentPosition(selected).stage==="Awaiting Receipt")&&(
+                  <button onClick={()=>{ onViewDocument(selected.controlNo); setSelected(null); }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold border"
+                    style={{ borderColor:C.border, color:C.purple, background:`${C.purple}12` }}>
+                    View Document
+                  </button>
+                )}
                 <Btn variant="ghost" onClick={()=>setSelected(null)}>Close</Btn>
               </div>
             </div>
@@ -3609,12 +4336,16 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
         <div className="fixed inset-0 flex items-center justify-center p-4"
           style={{ zIndex:1000, background:"rgba(0,0,0,0.65)", overflowY:"auto" }}
           onClick={event=>event.target===event.currentTarget&&setSelectedGroup(null)}>
-          <div role="dialog" aria-modal="true" aria-label={`Tracking details for group ${selectedGroup.controlNo}`}
+          <div role="dialog" aria-modal="true" aria-label="Tracking details for document group"
             className="rounded-2xl w-full max-w-4xl max-h-[calc(100dvh-2rem)] flex flex-col overflow-hidden modal-panel-enter"
             style={{ background:C.card, border:`1px solid ${C.border}`, boxShadow:"0 24px 60px rgba(0,0,0,0.6)" }}>
             <div className="flex items-center justify-between px-6 py-4" style={{ borderBottom:`1px solid ${C.border}` }}>
               <div>
-                <p className="text-sm font-bold" style={{ color:C.text }}>Group #{selectedGroup.controlNo}</p>
+                <p className="text-sm font-bold" style={{ color:C.text }}>
+                  {isCityAdminViewer
+                    ?`Group ${selectedGroup.controlNo}`
+                    :`Group · Docs IDs: ${selectedGroup.documents.map(doc=>doc.id).join(", ")}`}
+                </p>
                 <p className="text-xs mt-0.5" style={{ color:C.muted }}>{selectedGroup.documents.length} documents · shared journey</p>
               </div>
               <button onClick={()=>setSelectedGroup(null)} aria-label="Close group tracking details" className="text-xl" style={{ color:C.muted }}>×</button>
@@ -3626,16 +4357,31 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
               <div className="overflow-x-auto rounded-xl border" style={{ borderColor:C.border }}>
                 <table className="w-full min-w-[520px] text-left">
                   <thead><tr style={{ background:C.sidebar }}>
-                    {["Control No.","Particulars / Details","Type","P.R. No.","Status",""].map(label=>
+                    {[
+                      isCityAdminViewer?"Control No.":"Docs ID",
+                      ...(selectedGroup.documents.some(doc=>isOfficeCorrespondenceType(doc.type))
+                        ?[]
+                        :["Particulars / Details"]),
+                      "Type",
+                      ...(!selectedGroup.documents.some(doc=>isOfficeCorrespondenceType(doc.type))
+                        ?["P.R. No."]
+                        :[]),
+                      "Status","",
+                    ].map(label=>
                       <th key={label} className="px-3 py-2.5 text-xs font-semibold" style={{ color:C.text }}>{label}</th>
                     )}
                   </tr></thead>
                   <tbody>{selectedGroup.documents.map(doc=>(
                     <tr key={doc.id} style={{ borderTop:`1px solid ${C.border}` }}>
-                      <td className="px-3 py-2.5 text-xs font-semibold" style={{ color:C.purple }}>#{doc.id}</td>
-                      <td className="px-3 py-2.5 text-xs" style={{ color:C.sub }}>{doc.particulars}</td>
+                      <td className="px-3 py-2.5 text-xs font-semibold" style={{ color:C.purple }}>
+                        {isCityAdminViewer?doc.cityAdminControlNo??doc.id:doc.id}
+                      </td>
+                      {!selectedGroup.documents.some(member=>isOfficeCorrespondenceType(member.type))&&<>
+                        <td className="px-3 py-2.5 text-xs" style={{ color:C.sub }}>{doc.particulars}</td>
+                      </>}
                       <td className="px-3 py-2.5 text-xs" style={{ color:C.sub }}>{doc.type}</td>
-                      <td className="px-3 py-2.5 text-xs" style={{ color:C.sub }}>{doc.prNumber??"—"}</td>
+                      {!selectedGroup.documents.some(member=>isOfficeCorrespondenceType(member.type))&&
+                        <td className="px-3 py-2.5 text-xs" style={{ color:C.sub }}>{doc.prNumber??"—"}</td>}
                       <td className="px-3 py-2.5"><StatusBadge status={selectedGroup.completedAt?"Completed":doc.status}/></td>
                       <td className="px-3 py-2.5 text-right">
                         <button type="button" onClick={()=>setSelectedGroupDocument(docs.find(item=>item.id===doc.id)??doc)}
@@ -3651,16 +4397,16 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
               <div>
                 <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color:C.muted }}>Office Journey</p>
                 <DocumentStatusCard record={selectedGroup} doc={selectedGroup.documents[0]}
-                  groupDocuments={selectedGroup.documents} showSummary={false}/>
+                  groupDocuments={selectedGroup.documents} showSummary={false} viewerOffice={user?.office}/>
               </div>
               {(()=>{
                 const pos=getCurrentPosition(selectedGroup);
                 if (pos.office==="CA"&&pos.stage==="Awaiting Receipt") {
-                  return role==="staff"&&<div className="flex justify-end">
+                  return isCityAdminViewer&&role==="staff"&&<div className="flex justify-end">
                     <Btn onClick={()=>setShowGroupReceive(true)}>Confirm Group Receipt</Btn>
                   </div>;
                 }
-                if (role==="staff"&&pos.office==="CA"&&pos.stage==="Received"&&!selectedGroup.completedAt) {
+                if (isCityAdminViewer&&role==="staff"&&pos.office==="CA"&&pos.stage==="Received"&&!selectedGroup.completedAt) {
                   return <div className="flex justify-end gap-2">
                     <Btn variant="success" onClick={()=>void handleGroupAction("complete")}>Complete Group</Btn>
                     <Btn onClick={()=>setShowGroupForward(true)}>Forward Group Again</Btn>
@@ -3670,7 +4416,9 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
               })()}
               <div className="rounded-xl border p-4" style={{ borderColor:C.border, background:C.card2 }}>
                 <p className="text-xs font-semibold uppercase tracking-wider mb-3 text-center" style={{ color:C.muted }}>
-                  Group QR Code · #{selectedGroup.controlNo}
+                  {isCityAdminViewer
+                    ?`Group QR Code · ${selectedGroup.controlNo}`
+                    :"Group QR Code"}
                 </p>
                 <div className="flex justify-center rounded-lg p-3" style={{ background:"#fff" }}>
                   <QRCodeSVG id={`tracking-group-qr-${selectedGroup.groupId}`}
@@ -3692,29 +4440,46 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
             style={{ background:C.card, border:`1px solid ${C.border}`, boxShadow:"0 24px 60px rgba(0,0,0,0.6)" }}>
             <div className="flex items-center justify-between mb-5">
               <h3 className="text-sm font-bold" style={{ color:C.text }}>
-                Document #{selectedGroupDocument.id} — Read Only
+                {isCityAdminViewer
+                  ?`Document ${selectedGroupDocument.cityAdminControlNo??selectedGroupDocument.id}`
+                  :`Docs ID ${selectedGroupDocument.id}`} — Read Only
               </h3>
               <button type="button" onClick={()=>setSelectedGroupDocument(null)}
                 aria-label="Close document details" className="text-xl" style={{ color:C.muted }}>×</button>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {([
-                ["Control No.","#"+selectedGroupDocument.id],
-                ["Date",selectedGroupDocument.date?fmtDate(selectedGroupDocument.date):"—"],
-                ["Type",selectedGroupDocument.type],
-                ["Office",selectedGroupDocument.office],
-                ["Payroll/Voucher",selectedGroupDocument.payrollVoucher],
-                ["Particulars",selectedGroupDocument.particulars],
-                ["Fund",selectedGroupDocument.fund],
-                ["Amount","₱"+selectedGroupDocument.amount.toLocaleString()],
-                ["Signatory",selectedGroupDocument.signature],
-                ["Forwarded",selectedGroupDocument.dateForwarded?fmtLocalDateTime(selectedGroupDocument.dateForwarded):"—"],
-                ["Cheque No.",selectedGroupDocument.chequeNo??"—"],
-                ["Date Returned",selectedGroupDocument.dateReturned?fmtLocalDateTime(selectedGroupDocument.dateReturned):"—"],
-                ["Type",selectedGroupDocument.subType??"—"],
-                ["P.R. No.",selectedGroupDocument.prNumber??"—"],
-                ["Status",selectedGroupDocument.status],
-              ] as [string,string][]).map(([label,value])=>(
+              {(isOfficeCorrespondenceType(selectedGroupDocument.type)
+                ?[
+                  [isCityAdminViewer?"Control No.":"Docs ID",
+                    isCityAdminViewer?selectedGroupDocument.cityAdminControlNo??selectedGroupDocument.id:selectedGroupDocument.id],
+                  ["Date",selectedGroupDocument.date?fmtDate(selectedGroupDocument.date):"—"],
+                  ["Type",selectedGroupDocument.type],
+                  ["Office",selectedGroupDocument.office],
+                  ["Title",selectedGroupDocument.title??"—"],
+                  ["To",selectedGroupDocument.to??"—"],
+                  ["From",selectedGroupDocument.from??"—"],
+                  ["Subject",selectedGroupDocument.subject??"—"],
+                  ["Signatory",selectedGroupDocument.signature||"—"],
+                  ["Status",selectedGroupDocument.status],
+                ]
+                :[
+                  [isCityAdminViewer?"Control No.":"Docs ID",
+                    isCityAdminViewer?selectedGroupDocument.cityAdminControlNo??selectedGroupDocument.id:selectedGroupDocument.id],
+                  ["Date",selectedGroupDocument.date?fmtDate(selectedGroupDocument.date):"—"],
+                  ["Type",selectedGroupDocument.type],
+                  ["Office",selectedGroupDocument.office],
+                  ["Payroll/Voucher",selectedGroupDocument.payrollVoucher],
+                  ["Particulars",selectedGroupDocument.particulars],
+                  ["Fund",selectedGroupDocument.fund],
+                  ["Amount","₱"+selectedGroupDocument.amount.toLocaleString()],
+                  ["Signatory",selectedGroupDocument.signature],
+                  ["Forwarded",selectedGroupDocument.dateForwarded?fmtLocalDateTime(selectedGroupDocument.dateForwarded):"—"],
+                  ["Cheque No.",selectedGroupDocument.chequeNo??"—"],
+                  ["Date Returned",selectedGroupDocument.dateReturned?fmtLocalDateTime(selectedGroupDocument.dateReturned):"—"],
+                  ["Type (Secondary)",selectedGroupDocument.subType??"—"],
+                  ["P.R. No.",selectedGroupDocument.prNumber??"—"],
+                  ["Status",selectedGroupDocument.status],
+                ] as [string,string][]).map(([label,value])=>(
                 <div key={label} className="rounded-lg p-3" style={{ background:C.card2 }}>
                   <div className="text-xs mb-1" style={{ color:C.muted }}>{label}</div>
                   <div className="text-xs font-semibold break-words" style={{ color:C.text }}>{value}</div>
@@ -3732,7 +4497,6 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
       <div className="flex items-center justify-between tracking-reveal" style={{ animationDelay:"80ms" }}>
         <div>
           <h2 className="text-xl font-bold tracking-tight" style={{ color:C.text }}>Tracking Monitoring</h2>
-          <p className="text-xs mt-0.5" style={{ color:C.muted }}>CA → CTO → CBO → CAO → CA · Updated via QR scans</p>
         </div>
         <span className="text-xs px-2 py-0.5 rounded"
           style={{ background:"rgba(59,130,246,0.15)", color:C.blue }}>
@@ -3740,24 +4504,11 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
         </span>
       </div>
 
-      <div className="flex gap-2">
-        {([
-          { key:"single",label:"Single docs",count:trackingRecords.length },
-          { key:"group",label:"Docs by Set",count:groupTrackingRecords.length },
-        ] as const).map(tab=>(
-          <button key={tab.key} type="button" onClick={()=>setTrackingView(tab.key)}
-            className="rounded-lg px-4 py-2.5 text-sm font-semibold border"
-            style={{ borderColor:trackingView===tab.key?C.purple:C.border,
-              background:trackingView===tab.key?`${C.purple}20`:C.card2,
-              color:trackingView===tab.key?C.purple:C.sub }}>
-            {tab.label} <span className="ml-1 opacity-75">({tab.count})</span>
-          </button>
-        ))}
-      </div>
-
       <div className="flex flex-wrap items-center gap-3 tracking-reveal" style={{ animationDelay:"260ms" }}>
-        {[{ label:"Office", val:filterOffice, set:setFilterOffice, opts:["CTO","CBO","CAO","CA","Complete"] },
-          { label:"Stage",  val:filterStage,  set:setFilterStage,  opts:["Awaiting Receipt","Received","For Signature"] }].map(f=>(
+        {[
+          ...(isCityAdminViewer?[{ label:"Office", val:filterOffice, set:setFilterOffice, opts:[...getRoutingOfficeOptions(catalog.offices),"CA","Complete"] }]:[]),
+          { label:"Stage", val:filterStage, set:setFilterStage, opts:["Awaiting Receipt","Received","For Signature"] },
+        ].map(f=>(
           <select key={f.label} value={f.val} onChange={e=>f.set(e.target.value)}
             className="rounded-lg px-3 py-2.5 text-sm border outline-none"
             style={{ background:C.card2, borderColor:C.border, color:f.val?C.text:C.muted }}>
@@ -3771,12 +4522,11 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
             style={{ borderColor:C.border, color:C.muted }}>Clear</button>
         )}
         <span className="text-sm ml-auto" style={{ color:C.muted }}>
-          {trackingView==="single"?filtered.length:filteredGroups.length} {trackingView==="single"?"documents":"groups"}
+          {filtered.length} documents
         </span>
       </div>
 
-      {trackingView==="single"&&(
-        <div className="space-y-3">
+      <div className="space-y-3">
           {filtered.map((record,index)=>{
             const pos=getCurrentPosition(record);
             const doc=docs.find(d=>d.id===record.controlNo);
@@ -3791,7 +4541,11 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
                   <div className="flex items-center justify-between flex-wrap gap-2 pt-3"
                     style={{ borderTop:`1px solid ${C.border}` }}>
                     <div className="flex items-center gap-3">
-                      <span className="text-sm font-bold" style={{ color:C.purple }}>#{record.controlNo}</span>
+                      <span className="text-sm font-bold" style={{ color:C.purple }}>
+                        {record.source==="office"
+                          ?`Docs ID ${record.controlNo}`
+                          :record.controlNo}
+                      </span>
                       <span className="text-xs" style={{ color:C.sub }}>{doc?.particulars??record.particulars}</span>
                       <span className="text-xs font-semibold px-1.5 py-0.5 rounded"
                         style={{ background:C.card2, color:C.muted }}>{record.type}</span>
@@ -3812,46 +4566,7 @@ function TrackingMonitoring({ trackingRecords, setTrackingRecords, groupTracking
               <p className="text-xs" style={{ color:C.muted }}>No documents in transit match the current filters.</p>
             </div>
           )}
-        </div>
-      )}
-      {trackingView==="group"&&(
-        <div className="space-y-3">
-          {filteredGroups.map((record,index)=>{
-            const pos=getCurrentPosition(record);
-            const sc=STAGE_CFG[pos.stage]??{ color:C.muted, bg:"rgba(255,255,255,0.05)" };
-            return (
-              <Card key={record.id} className="cursor-pointer transition-colors tracking-reveal"
-                style={{ animationDelay:`${440+index*110}ms` }}>
-                <div className="p-4" onClick={()=>setSelectedGroup(record)}>
-                  <div className="overflow-x-auto mb-4">
-                    <div style={{ minWidth:380 }}><JourneyStepper record={record} compact/></div>
-                  </div>
-                  <div className="flex items-center justify-between flex-wrap gap-2 pt-3"
-                    style={{ borderTop:`1px solid ${C.border}` }}>
-                    <div className="flex items-center gap-3">
-                      <span className="text-sm font-bold" style={{ color:C.purple }}>#{record.controlNo}</span>
-                      <span className="text-xs" style={{ color:C.sub }}>{record.documents.length} documents · {record.particulars}</span>
-                      <span className="text-xs font-semibold px-1.5 py-0.5 rounded"
-                        style={{ background:C.card2, color:C.muted }}>GROUP</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-semibold px-2 py-0.5 rounded-full"
-                        style={{ background:sc.bg, color:sc.color }}>{pos.stage}</span>
-                      <span className="text-xs font-semibold" style={{ color:C.sub }}>{pos.office}</span>
-                      <span className="text-xs" style={{ color:C.muted }}>View →</span>
-                    </div>
-                  </div>
-                </div>
-              </Card>
-            );
-          })}
-          {filteredGroups.length===0&&(
-            <div className="py-12 text-center tracking-reveal">
-              <p className="text-xs" style={{ color:C.muted }}>No grouped documents in transit match the current filters.</p>
-            </div>
-          )}
-        </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -3884,7 +4599,7 @@ function GroupDocumentReadOnlyNotice({ group, doc, mutedTextColor="#475569" }:{
         This document is part of a group and is view-only.
       </p>
       <p style={{ fontSize:11, color:mutedTextColor, margin:"5px 0 0" }}>
-        Control No. #{doc.id} belongs to group #{group.controlNo}. Tracking actions apply to the group.
+        Control No. {doc.id} belongs to group {group.controlNo}. Tracking actions apply to the group.
       </p>
       <div style={{ marginTop:12, paddingTop:10, borderTop:"1px solid #BFDBFE" }}>
         <p style={{ fontSize:11, fontWeight:700, color:"#1E293B", margin:0 }}>Recent group transaction</p>
@@ -3901,8 +4616,9 @@ function GroupDocumentReadOnlyNotice({ group, doc, mutedTextColor="#475569" }:{
   );
 }
 
-function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, setDocs, setTrackingRecords, setGroupTrackingRecords, onRefresh, refreshing }:{
+function OfficeMiniSystem({ mode, customOfficeName, docs, trackingRecords, groupTrackingRecords, setDocs, setTrackingRecords, setGroupTrackingRecords, onRefresh, refreshing }:{
   mode:AppMode; docs:DocRecord[];
+  customOfficeName?:string;
   trackingRecords:TrackingRecord[];
   groupTrackingRecords:GroupTrackingRecord[];
   setDocs:React.Dispatch<React.SetStateAction<DocRecord[]>>;
@@ -3910,12 +4626,15 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
   setGroupTrackingRecords:React.Dispatch<React.SetStateAction<GroupTrackingRecord[]>>;
   onRefresh:()=>Promise<void>; refreshing:boolean;
 }) {
-  const officeName=MODE_OFFICE_NAME[mode];
-  const journeyStep=MODE_TO_STEP[mode] as string;
+  const officeName=mode==="office-custom"
+    ?customOfficeName?.trim()??""
+    :MODE_OFFICE_NAME[mode];
+  const journeyStep=mode==="office-custom"?getTrackingOfficeIdentifier(officeName):MODE_TO_STEP[mode] as string;
   const stepKey=STEP_KEY[journeyStep];
   const ACCENT:Record<AppMode,string>={
     "main":"#6C4FF5","processor":"#6C4FF5",
     "office-ct":"#3B82F6","office-cb":"#F59E0B","office-ca":"#10B981",
+    "office-custom":"#3B82F6",
   };
   const accent=ACCENT[mode];
   const DC={ bg:"#0B0E1A", card:"#141827", card2:"#1A1F35", sidebar:"#0D1021",
@@ -3932,7 +4651,8 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
   const [receiveAnimating,setReceiveAnimating]=useState(false);
   const [animatingButton,setAnimatingButton]=useState<string|null>(null);
   const [scanError,setScanError]=useState("");
-  const [officeStaff,setOfficeStaff]=useState<OfficeStaffRow[]>([]);
+  const [officeNames,setOfficeNames]=useState<string[]>([]);
+  const [officeListError,setOfficeListError]=useState("");
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const documentDetailsRef=useRef<HTMLDivElement|null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -3954,10 +4674,16 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
 
   useEffect(() => () => stopCamera(), []);
   useEffect(()=>{
-    fetch('/api/users.php').then(r=>r.json()).then(data=>{
-      if (data.success) setOfficeStaff((data.officeStaff??[]).filter((member:OfficeStaffRow)=>member.office===officeName&&member.status==="Active"));
-    }).catch(()=>setOfficeStaff([]));
-  },[officeName]);
+    fetch('/api/catalog.php?type=offices').then(response=>response.json()).then(data=>{
+      if (!data.success||!Array.isArray(data.items)) throw new Error(data.message??"Unable to load the office list.");
+      setOfficeNames(data.items.map((item:{name:string})=>item.name));
+      setOfficeListError("");
+    }).catch(error=>{
+      console.error("Failed to load routing offices",error);
+      setOfficeNames([]);
+      setOfficeListError(error instanceof Error?error.message:"Unable to load the active office list.");
+    });
+  },[]);
 
   const currentRecord=trackingRecords.find(r=>r.controlNo===(foundDoc?.id??""))??null;
   const currentGroup=groupTrackingRecords.find(group=>group.groupId===foundGroup?.groupId)??foundGroup;
@@ -4011,7 +4737,7 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
       return;
     }
     setFoundGroup(null);
-    const cn=normalized.padStart(7,"0");
+    const cn=/^\d{1,7}$/.test(normalized)?normalized.padStart(7,"0"):normalized;
     const doc=docs.find(d=>d.id===cn);
     const documentGroup=doc
       ?groupTrackingRecords.find(item=>item.documents.some(member=>member.id===cn))??null
@@ -4179,7 +4905,7 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
       return false;
     }
     try {
-      const response=await fetch('/api/group-tracking-update.php',{
+      const response=await fetch('/api/group-tracking-update.php?portal=1',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
@@ -4191,7 +4917,7 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
       if (!response.ok||!payload?.success) {
         throw new Error(payload?.message??`Group tracking update failed (${response.status})`);
       }
-      const groupsResponse=await fetch('/api/group-tracking.php',{cache:'no-store'});
+      const groupsResponse=await fetch('/api/group-tracking.php?portal=1',{cache:'no-store'});
       const groupsPayload=await groupsResponse.json().catch(()=>null);
       if (!groupsResponse.ok||!groupsPayload?.success) {
         throw new Error(groupsPayload?.message??`Tracking action saved, but group tracking could not be refreshed (${groupsResponse.status}).`);
@@ -4223,8 +4949,7 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
 
   const activeTrackingRecord=currentGroup??currentRecord;
   const currentVisit=activeTrackingRecord?.visits?.[activeTrackingRecord.visits.length-1];
-  const isProcessorHandoff=!!currentVisit?.forwarded&&currentVisit.forwardedTo==="PRC"&&
-    ["CTO","CBO","CAO"].includes(journeyStep);
+  const isProcessorHandoff=!!currentVisit?.forwarded&&currentVisit.forwardedTo==="PRC"&&journeyStep!=="CA";
   const isIncoming=!!currentVisit?.forwarded&&
     (currentVisit.forwardedTo===journeyStep||isProcessorHandoff);
   const activeVisit=isIncoming?null:currentVisit?.office===journeyStep?currentVisit:null;
@@ -4248,10 +4973,12 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
 
   return (
     <div className="min-h-screen page-enter" style={{ background:"#F0F2F8", fontFamily:"Inter,sans-serif" }}>
+      {officeListError&&<p role="alert" style={{ margin:0, padding:"8px 16px", textAlign:"center",
+        background:"#FEF2F2", color:"#B91C1C", fontSize:12 }}>{officeListError} Office forwarding options may be incomplete.</p>}
       {pendingAction&&(
         <ConfirmActionModal action={pendingAction} targetOffice={pendingAction==="forward"?"Forward Document":"Complete Tracking"}
-          nextOffices={["CA","CTO","CBO","CAO"].filter(office=>office!==journeyStep)}
-          staff={officeStaff}
+          nextOffices={[...new Set(["CA",...getRoutingOfficeOptions(officeNames)])].filter(office=>office!==journeyStep)}
+          staff={[]}
           trackingDetails={pendingAction==="complete"?{
             controlNo:activeTrackingRecord?.controlNo??foundDoc?.id??"",
             particulars:activeTrackingRecord?.particulars??foundDoc?.particulars??"",
@@ -4354,8 +5081,7 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
                 ):(
                   <div style={{ display:"grid", gap:6, maxHeight:250, overflowY:"auto" }}>
                     {visibleOfficeNotifications.map(notification=>{
-                      const canOpenDirectly=["CTO","CBO","CAO","PRC"].includes(notification.fromOfficeCode)||
-                        (notification.fromOfficeCode==="CA"&&notification.stage!=="Awaiting Receipt");
+                      const canOpenDirectly=notification.fromOfficeCode!=="CA"||notification.stage!=="Awaiting Receipt";
                       const content=(
                         <>
                           <span style={{ display:"block", fontSize:11, fontWeight:700, color:"#000" }}>
@@ -4458,7 +5184,8 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
               </div>
             </div>
             <DocumentStatusCard record={stepRecord} doc={foundDoc??currentGroup?.documents[0]}
-              stepKey={stepKey} groupDocuments={foundDoc?[foundDoc]:currentGroup?.documents} mutedTextColor="#000"/>
+              stepKey={stepKey} groupDocuments={foundDoc?[foundDoc]:currentGroup?.documents}
+              mutedTextColor="#000" viewerOffice={officeName}/>
             {isGroupedDocumentLookup&&<GroupDocumentReadOnlyNotice group={currentGroup} doc={foundDoc} mutedTextColor="#000"/>}
 
             {!isGroupedDocumentLookup&&!isTrackingComplete&&!allDone&&isCurrentOffice&&(
@@ -4555,188 +5282,309 @@ function OfficeMiniSystem({ mode, docs, trackingRecords, groupTrackingRecords, s
 
 // ─── PROCESSOR MINI SYSTEM ────────────────────────────────────────────────────
 
-function ProcessorMiniSystem({ docs, trackingRecords, groupTrackingRecords, initialControlNumber, initialDataLoaded }:{
-  docs:DocRecord[]; trackingRecords:TrackingRecord[]; groupTrackingRecords:GroupTrackingRecord[];
-  initialControlNumber?:string; initialDataLoaded:boolean;
-}) {
-  const DC={ bg:"#0B0E1A", card:"#141827", card2:"#1A1F35", sidebar:"#0D1021",
-    border:"rgba(255,255,255,0.07)", text:"#E8EAF2", muted:"#6B7494", sub:"#A0A8C0", purple:"#6C4FF5" };
-  const [foundDoc,setFoundDoc]=useState<DocRecord|null>(null);
-  const [foundRecord,setFoundRecord]=useState<TrackingRecord|null>(null);
-  const [foundGroup,setFoundGroup]=useState<GroupTrackingRecord|null>(null);
-  const [notFound,setNotFound]=useState(false);
-  const initialLookupDone=useRef(false);
+function ProcessorMiniSystem({ initialControlNumber }:{ initialControlNumber?:string }) {
+  const [controlNumber,setControlNumber]=useState(initialControlNumber??"");
+  const [result,setResult]=useState<{controlNo:string;currentOffice:string;status:string}|null>(null);
+  const [error,setError]=useState("");
+  const [loading,setLoading]=useState(false);
 
-  const normalizeProcessorControlNumber=(value:string)=>value.replace(/\D/g,"").replace(/^0+(?=\d)/,"");
-
-  const handleSearch=(input:string)=>{
-    const normalized=input.replace(/^#/,"").trim();
-    const groupRange=parseGroupRangeFromQr(normalized);
-    const matchingGroup=groupRange
-      ?groupTrackingRecords.find(item=>item.controlNo===groupRange)??null
-      :null;
-    if (matchingGroup) {
-      setFoundGroup(matchingGroup);
-      setFoundDoc(null);
-      setFoundRecord(null);
-      setNotFound(false);
+  const lookup=async(value:string)=>{
+    const parsed=parseControlNumberFromQr(value);
+    if (!parsed) {
+      setResult(null);
+      setError("Scan a system document QR code or enter its Docs ID/control number.");
       return;
     }
-    const controlNumber=parseControlNumberFromQr(normalized)??normalized;
-    const canonicalControlNumber=normalizeProcessorControlNumber(controlNumber);
-    const doc=docs.find(item=>normalizeProcessorControlNumber(item.id)===canonicalControlNumber);
-    const rec=trackingRecords.find(item=>
-      normalizeProcessorControlNumber(item.controlNo)===canonicalControlNumber,
-    )??null;
-    const documentGroup=doc
-      ?groupTrackingRecords.find(item=>item.documents.some(member=>
-        normalizeProcessorControlNumber(member.id)===canonicalControlNumber,
-      ))??null
-      :null;
-    setFoundGroup(documentGroup);
-    setFoundDoc(doc??null);
-    setFoundRecord(documentGroup?null:rec);
-    setNotFound(!doc&&!rec);
+    setControlNumber(parsed);
+    setResult(null);
+    setError("");
+    setLoading(true);
+    try {
+      const response=await fetch(`/api/processor-lookup.php?control_no=${encodeURIComponent(parsed)}`,{cache:"no-store"});
+      const payload=await response.json();
+      if (!response.ok||!payload.success) {
+        setResult(null);
+        setError(payload.message||"Unable to look up this document.");
+        return;
+      }
+      setResult(payload.document);
+    } catch (lookupError) {
+      console.error("Processor document lookup failed",lookupError);
+      setResult(null);
+      setError("Unable to connect to the document tracking service.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(()=>{
-    if (!initialControlNumber||!initialDataLoaded||initialLookupDone.current) return;
-    initialLookupDone.current=true;
-    handleSearch(initialControlNumber);
-  },[initialControlNumber,initialDataLoaded]);
-
-  const processorTrackingRecord=foundGroup??foundRecord;
-  const processorPosition=processorTrackingRecord?getCurrentPosition(processorTrackingRecord):null;
-  const processorOfficeNames:Record<string,string>={
-    CA:"City Administrator's Office",
-    CTO:"City Treasurer's Office",
-    CBO:"City Budget Office",
-    CAO:"City Accounting Office",
-    PRC:"Processors",
-    Complete:"Tracking Complete",
-  };
-  const processorVisits=processorTrackingRecord?.visits??[];
-  const latestProcessorReceipt=processorVisits.slice().reverse().find(visit=>visit.received)??null;
-  const legacyReceipt=processorTrackingRecord
-    ?[
-      processorTrackingRecord.cto,
-      processorTrackingRecord.cbo,
-      processorTrackingRecord.cao,
-      processorTrackingRecord.caReturn,
-    ].filter((step):step is {received:string;receivedBy?:string}=>!!step?.received)
-      .sort((left,right)=>Date.parse(right.received)-Date.parse(left.received))[0]
-    :null;
-  const processorReceivedBy=latestProcessorReceipt?.receivedBy??legacyReceipt?.receivedBy??"Not recorded";
-  const processorStatus=processorPosition?.stage==="Awaiting Receipt"&&processorTrackingRecord&&
-      isAwaitingReceiptAtOffice(processorTrackingRecord,processorPosition.office)
-    ?"Forwarded"
-    :processorPosition?.stage==="Complete"
-      ?"Tracking Complete"
-      :processorPosition?.stage??"Not yet received";
-  const processorStatusColor=processorStatus==="Received"?"#3B82F6"
-    :processorStatus==="For Signature"?"#8B5CF6"
-      :processorStatus==="Forwarded"||processorStatus==="Tracking Complete"?"#10B981"
-        :"#64748B";
+    if (initialControlNumber) void lookup(initialControlNumber);
+  },[initialControlNumber]);
 
   return (
     <div className="min-h-screen page-enter" style={{ background:"#F0F2F8", fontFamily:"Inter,sans-serif" }}>
-      <div style={{ background:DC.sidebar, borderBottom:`1px solid ${DC.border}` }}>
-        <div style={{ maxWidth:520, margin:"0 auto", display:"flex", justifyContent:"center", alignItems:"center", padding:"12px 16px" }}>
-          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-            <GingoogSeal size={34}/>
-            <div>
-              <p style={{ fontSize:14, fontWeight:700, color:"#fff", margin:0, lineHeight:1.3 }}>ADTRAQS</p>
-              <p style={{ fontSize:12, color:DC.purple, margin:0 }}>Processor · Document Status Lookup</p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ maxWidth:520, margin:"0 auto", padding:"20px 16px", display:"flex", flexDirection:"column", gap:16 }}>
-        {notFound&&<div style={{ borderRadius:16, padding:"16px", textAlign:"center",
-          background:"#FEF2F2", border:"1px solid #FECACA", color:"#DC2626", fontSize:14 }}>Document not found.</div>}
-
-        {(foundDoc||foundRecord||foundGroup)&&!notFound&&(
-          <>
-            <div style={{ borderRadius:16, padding:16, background:"#fff", border:"1px solid #E2E8F0" }}>
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:12, marginBottom:12 }}>
-                <div>
-                  <p style={{ fontSize:13, fontWeight:700, color:"#1A2035", margin:"0 0 6px" }}>Tracking summary</p>
-                  <span style={{ fontSize:13, fontWeight:800, color:"#6C4FF5" }}>
-                    #{foundDoc?.id??foundGroup?.controlNo??foundRecord?.controlNo}
-                  </span>
-                </div>
-                <span style={{ flexShrink:0, borderRadius:999, padding:"5px 10px", fontSize:11, fontWeight:700,
-                  color:processorStatusColor, background:`${processorStatusColor}18` }}>
-                  {processorStatus}
-                </span>
-              </div>
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-                <div>
-                  <div style={{ fontSize:10, color:"#000" }}>Current office</div>
-                  <div style={{ fontSize:12, fontWeight:600, color:"#1A2035", marginTop:2 }}>
-                    {processorPosition
-                      ?processorOfficeNames[processorPosition.office]??processorPosition.office
-                      :"City Administrator's Office"}
-                  </div>
-                </div>
-                <div style={{ gridColumn:"1 / -1" }}>
-                  <div style={{ fontSize:10, color:"#000" }}>Most recently received by</div>
-                  <div style={{ fontSize:12, fontWeight:600, color:"#1A2035", marginTop:2 }}>{processorReceivedBy}</div>
-                </div>
-              </div>
-            </div>
-            {foundGroup?(
-              <div style={{ borderRadius:20, padding:16, overflow:"hidden", background:"#fff", border:"1px solid #DDE1EE" }}>
-                <div style={{ overflowX:"auto" }}>
-                  <div style={{ minWidth:360 }}><JourneyStepper record={foundGroup} compact labelColor="#000"/></div>
-                </div>
-              </div>
-            ):foundRecord?(
-              <div style={{ borderRadius:20, padding:16, overflow:"hidden", background:"#fff", border:"1px solid #DDE1EE" }}>
-                <div style={{ overflowX:"auto" }}>
-                  <div style={{ minWidth:360 }}><JourneyStepper record={foundRecord} compact labelColor="#000"/></div>
-                </div>
-              </div>
-            ):(
-              <div style={{ borderRadius:20, padding:16, background:"#fff", border:"1px solid #DDE1EE" }}>
-                <p style={{ fontSize:12, color:"#000", margin:0 }}>This document has not yet entered the tracking journey.</p>
-              </div>
-            )}
-            {foundGroup?(
-              <>
-                <DocumentStatusCard record={foundGroup} doc={foundDoc??foundGroup.documents[0]}
-                  groupDocuments={foundDoc?[foundDoc]:foundGroup.documents} mutedTextColor="#000"/>
-                {foundDoc&&<GroupDocumentReadOnlyNotice group={foundGroup} doc={foundDoc} mutedTextColor="#000"/>}
-              </>
-            ):foundRecord?(
-              <DocumentStatusCard record={foundRecord} doc={foundDoc??undefined} mutedTextColor="#000"/>
-            ):(
-              <div style={{ borderRadius:16, padding:16, background:"#fff", border:"1px solid #E2E8F0" }}>
-                <p style={{ fontSize:13, fontWeight:700, color:"#1A2035", margin:"0 0 8px" }}>#{foundDoc?.id}</p>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-                  {[["Particulars",foundDoc?.particulars??"—"],["Type",foundDoc?.type??"—"],
-                    ["Office",foundDoc?.office??"—"],["Status",foundDoc?.status??"—"]].map(([k,v])=>(
-                    <div key={k}>
-                      <div style={{ fontSize:10, color:"#000" }}>{k}</div>
-                      <div style={{ fontSize:12, fontWeight:600, color:"#1A2035", marginTop:2 }}>{v}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
-        )}
-        {processorTrackingRecord?.completedAt&&(
-          <div role="status" style={{ borderRadius:16, padding:16, textAlign:"center",
-            background:"rgba(16,185,129,0.08)", border:"1px solid rgba(16,185,129,0.25)" }}>
-            <p style={{ fontSize:20, fontWeight:800, color:"#059669", margin:0 }}>Tracking Completed</p>
-            <p style={{ fontSize:13, fontWeight:600, color:"#1A2035", margin:"6px 0 0" }}>
-              {fmtStepDate(processorTrackingRecord.completedAt)}
+      <header className="px-4 py-3 text-center" style={{ background:"#0D1021" }}>
+        <p className="text-sm font-bold text-white">ADTRAQS</p>
+        <p className="text-xs" style={{ color:"#A0A8C0" }}>Document Location Lookup</p>
+      </header>
+      <main className="mx-auto flex max-w-lg flex-col gap-4 p-4">
+        <form className="flex gap-2" onSubmit={event=>{ event.preventDefault(); void lookup(controlNumber); }}>
+          <input
+            aria-label="Document Docs ID or control number"
+            className="min-w-0 flex-1 rounded-lg border px-3 py-2 text-sm"
+            value={controlNumber}
+            onChange={event=>setControlNumber(event.target.value)}
+            placeholder="Scan a system QR code or enter Docs ID/control number"
+          />
+          <button type="submit" disabled={loading}
+            className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+            style={{ background:"#6C4FF5" }}>
+            {loading?"Checking…":"Check"}
+          </button>
+        </form>
+        {error&&<p role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+        {result&&(
+          <section aria-live="polite" className="rounded-xl border bg-white p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              {/^\d+$/.test(result.controlNo)?"Control number":"Docs ID"}
             </p>
-          </div>
+            <p className="mt-1 text-lg font-bold text-slate-900">{result.controlNo}</p>
+            <p className="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Current location</p>
+            <p className="mt-1 text-base font-semibold text-slate-900">{result.currentOffice}</p>
+            <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Status</p>
+            <p className="mt-1 text-sm text-slate-800">{result.status}</p>
+          </section>
         )}
+      </main>
+    </div>
+  );
+}
+
+function DocumentTracking({ trackingRecords,setTrackingRecords,user,catalog,role }:{
+  trackingRecords:TrackingRecord[];
+  setTrackingRecords:React.Dispatch<React.SetStateAction<TrackingRecord[]>>;
+  user:AuthUser|null;
+  catalog:CatalogData;
+  role:Role;
+}) {
+  const C=useC();
+  const [selected,setSelected]=useState<TrackingRecord|null>(null);
+  const [pendingAction,setPendingAction]=useState<"receive"|"forSig"|"forward"|null>(null);
+  const [submitting,setSubmitting]=useState(false);
+  const officeCode=getTrackingOfficeIdentifier(user?.office??"");
+  const officeName=user?.office??"Assigned Office";
+  const actor=getTrackingActor(user);
+  const officeLabel=(code:string)=>OFFICE_DISPLAY_NAME[code]??
+    catalog.offices.find(office=>getTrackingOfficeIdentifier(office)===code)??code;
+  const currentRecords=trackingRecords
+    .filter(record=>{
+      const position=getCurrentPosition(record);
+      return position.stage!=="Complete"&&
+        getTrackingOfficeIdentifier(position.office)===officeCode;
+    })
+    .sort((a,b)=>getLatestTrackingActivityTime(b)-getLatestTrackingActivityTime(a));
+  const getTrackingIdLabel=(record:TrackingRecord)=>record.source==="office"?"Docs ID":"Control Number";
+  const idLabels=new Set(currentRecords.map(getTrackingIdLabel));
+  const idColumnLabel=idLabels.size===1?[...idLabels][0]:"Document ID";
+  const forwardDestinations=getForwardDestinationOptions(catalog.offices,officeCode);
+  const stageStyle=(stage:string)=>{
+    if (stage==="Awaiting Receipt") return { color:"#F59E0B",bg:"rgba(245,158,11,0.12)" };
+    if (stage==="Received") return { color:C.blue,bg:"rgba(59,130,246,0.12)" };
+    if (stage==="For Signature") return { color:C.purple,bg:"rgba(108,79,245,0.12)" };
+    return { color:C.muted,bg:C.card2 };
+  };
+  const refreshTracking=async()=>{
+    const response=await fetch('/api/tracking.php',{cache:'no-store'});
+    const payload=await response.json().catch(()=>null);
+    if (!response.ok||!payload?.success) {
+      throw new Error(payload?.message??`Tracking was updated, but the inbox could not be refreshed (${response.status}).`);
+    }
+    const refreshed:TrackingRecord[]=payload.tracking??[];
+    setTrackingRecords(refreshed);
+    return refreshed;
+  };
+  const handleAction=async(options:{forwardedBy:string;forwardDest?:string})=>{
+    if (!selected||!pendingAction) return;
+    if (role!=="staff") {
+      alert("Only staff accounts can update document tracking.");
+      return;
+    }
+    const forwardedBy=options.forwardedBy.trim()||actor;
+    if (!forwardedBy) {
+      alert("Add your 11-digit contact number in your profile before updating document tracking.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const response=await fetch('/api/tracking-update.php',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          controlNo:selected.controlNo,
+          office:officeCode,
+          action:pendingAction,
+          forwardedTo:options.forwardDest,
+          actor:forwardedBy,
+        }),
+      });
+      const payload=await response.json().catch(()=>null);
+      if (!response.ok||!payload?.success) {
+        throw new Error(payload?.message??`Tracking update failed (${response.status}).`);
+      }
+      const refreshed=await refreshTracking();
+      if (pendingAction==="forward") {
+        setSelected(null);
+      } else {
+        const updated=refreshed.find(record=>record.controlNo===selected.controlNo);
+        if (updated) setSelected(updated);
+      }
+      setPendingAction(null);
+    } catch(error) {
+      alert(error instanceof Error?error.message:"Unable to update document tracking.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="p-5 space-y-5">
+      {pendingAction&&selected&&(
+        <ConfirmActionModal action={pendingAction} targetOffice={officeName}
+          nextOffices={pendingAction==="forward"?forwardDestinations:undefined}
+          defaultActor={actor} submitting={submitting}
+          onConfirm={options=>void handleAction(options)}
+          onCancel={()=>setPendingAction(null)}/>
+      )}
+      {selected&&(
+        <ModalOverlay wide onClose={()=>setSelected(null)}>
+          <div className="space-y-5">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide" style={{ color:C.muted }}>Document details</p>
+              <h3 className="mt-1 text-lg font-bold" style={{ color:C.text }}>
+                {selected.source==="office"?"Docs ID ":""}{selected.controlNo}
+              </h3>
+              <p className="mt-1 text-sm" style={{ color:C.sub }}>{selected.particulars}</p>
+            </div>
+            <Card className="p-4">
+              <JourneyStepper record={selected}/>
+            </Card>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {[
+                { label:"Current location",value:officeName },
+                { label:"Status",value:getCurrentPosition(selected).stage },
+                { label:"Last activity",value:fmtLocalDateTime(
+                  selected.completedAt??selected.visits?.flatMap(visit=>[visit.forwarded,visit.forSig,visit.received])
+                    .filter((timestamp):timestamp is string=>!!timestamp).at(-1)??selected.initiatedAt,
+                ) },
+              ].map(item=>(
+                <Card key={item.label} className="p-3">
+                  <p className="text-xs" style={{ color:C.muted }}>{item.label}</p>
+                  <p className="mt-1 text-sm font-semibold" style={{ color:C.text }}>{item.value}</p>
+                </Card>
+              ))}
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t pt-4" style={{ borderColor:C.border }}>
+              <Btn variant="ghost" onClick={()=>setSelected(null)}>Close</Btn>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-bold tracking-tight" style={{ color:C.text }}>Document Tracking</h2>
+          <p className="mt-1 text-sm" style={{ color:C.muted }}>
+            Select a document routed to {officeName} to review it and update its tracking.
+          </p>
+        </div>
+        <span className="rounded-full px-3 py-1 text-xs font-semibold"
+          style={{ background:"rgba(59,130,246,0.12)",color:C.blue }}>
+          {currentRecords.length} {currentRecords.length===1?"document":"documents"}
+        </span>
       </div>
+
+      <Card className="overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[820px] text-left text-sm">
+            <thead style={{ background:C.card2,color:C.sub }}>
+              <tr>
+                {[idColumnLabel,"Document","Forwarded From","Current Location","Status","Last Activity","Actions"].map(label=>(
+                  <th key={label||"details"} className="px-4 py-3 text-xs font-semibold">{label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {currentRecords.map(record=>{
+                const position=getCurrentPosition(record);
+                const style=stageStyle(position.stage);
+                const lastActivity=getLatestTrackingActivityTime(record);
+                const sourceOffice=record.originOffice||
+                  getForwardingOfficeName(record,officeCode);
+                return (
+                  <tr key={record.id} tabIndex={0}
+                    onClick={()=>setSelected(record)}
+                    onKeyDown={event=>{
+                      if (event.key==="Enter"||event.key===" ") {
+                        event.preventDefault();
+                        setSelected(record);
+                      }
+                    }}
+                    className="cursor-pointer hover:bg-black/[0.03] focus-visible:outline focus-visible:outline-2"
+                    style={{ borderTop:`1px solid ${C.border}` }}>
+                    <td className="px-4 py-3 font-semibold whitespace-nowrap" style={{ color:C.purple }}>
+                      {idLabels.size===1
+                        ?record.controlNo
+                        :`${getTrackingIdLabel(record)} ${record.controlNo}`}
+                    </td>
+                    <td className="px-4 py-3">
+                      <p className="font-medium" style={{ color:C.text }}>{record.particulars||record.subject||"—"}</p>
+                      <p className="mt-0.5 text-xs" style={{ color:C.muted }}>{record.type}</p>
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap" style={{ color:C.sub }}>{officeLabel(getTrackingOfficeIdentifier(sourceOffice))}</td>
+                    <td className="px-4 py-3 whitespace-nowrap" style={{ color:C.text }}>{officeName}</td>
+                    <td className="px-4 py-3">
+                      <span className="rounded-full px-2.5 py-1 text-xs font-semibold whitespace-nowrap"
+                        style={{ background:style.bg,color:style.color }}>{position.stage}</span>
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-xs" style={{ color:C.muted }}>
+                      {lastActivity?fmtLocalDateTime(new Date(lastActivity).toISOString()):"—"}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap" onClick={event=>event.stopPropagation()}>
+                      {role!=="staff"?(
+                        <span className="text-xs" style={{ color:C.muted }}>View only</span>
+                      ):position.stage==="Awaiting Receipt"?(
+                        <Btn variant="success" size="default" onClick={()=>{
+                          setSelected(record);
+                          setPendingAction("receive");
+                        }}>Confirm Receipt</Btn>
+                      ):position.stage==="Received"?(
+                        <Btn size="default" onClick={()=>{
+                          setSelected(record);
+                          setPendingAction("forSig");
+                        }}>Mark For Signature</Btn>
+                      ):position.stage==="For Signature"?(
+                        <Btn size="default" disabled={!forwardDestinations.length} onClick={()=>{
+                          setSelected(record);
+                          setPendingAction("forward");
+                        }}>Forward</Btn>
+                      ):(
+                        <span className="text-xs" style={{ color:C.muted }}>—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {currentRecords.length===0&&(
+                <tr>
+                  <td colSpan={7} className="px-4 py-12 text-center text-sm" style={{ color:C.muted }}>
+                    No documents are currently routed to your office.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -4801,11 +5649,12 @@ function Reports({ docs, catalog, trackingRecords, groupTrackingRecords }:{
       const allCompleted=group.documents.length>0&&group.documents.every(member=>{
         const currentDoc=docs.find(item=>item.id===member.id);
         return !!currentDoc&&!!getForwardedTimestamp(currentDoc)&&
-          hasCompleteDocumentDetails(currentDoc,hasCityAdminReceipt(currentDoc));
+          hasCompleteDocumentDetails(currentDoc,hasCityAdminReceipt(currentDoc),hasCityAdminReceipt(currentDoc));
       });
       return allCompleted&&hasCityAdminReceipt(doc)&&canEditDoc(doc);
     }
-    return !!getForwardedTimestamp(doc)&&hasCompleteDocumentDetails(doc,hasCityAdminReceipt(doc))&&
+    return !!getForwardedTimestamp(doc)&&
+      hasCompleteDocumentDetails(doc,hasCityAdminReceipt(doc),hasCityAdminReceipt(doc))&&
       hasCityAdminReceipt(doc)&&canEditDoc(doc);
   };
   const signatureCounts=Array.from(filtered.reduce((counts,doc)=>{
@@ -4828,7 +5677,7 @@ function Reports({ docs, catalog, trackingRecords, groupTrackingRecords }:{
       "Cheque No.","Date Fwd. (Returned)","Type","P.R. No."];
     const escape=(value:string|number)=>`"${String(value??"").replace(/"/g,"\"\"")}"`;
     const rows=filtered.slice().sort((a,b)=>b.id.localeCompare(a.id)).map(doc=>[
-      `#${doc.id}`,doc.date,doc.type,doc.office,doc.particulars,doc.fund,doc.amount,
+      doc.id,doc.date,doc.type,doc.office,doc.particulars,doc.fund,doc.amount,
       doc.signature,doc.chequeNo??"",doc.dateReturned??"",doc.subType??"",doc.prNumber??"",
     ].map(escape).join(","));
     const blob=new Blob([[headers.map(escape).join(","),...rows].join("\r\n")],{ type:"text/csv;charset=utf-8;" });
@@ -5010,7 +5859,7 @@ function Reports({ docs, catalog, trackingRecords, groupTrackingRecords }:{
               </ResponsiveContainer>
             </Card>
           </div>
-          <BottleneckCard trackingRecords={trackingRecords}/>
+          <BottleneckCard trackingRecords={trackingRecords} offices={catalog.offices}/>
       </>
     </div>
   );
@@ -5020,20 +5869,13 @@ function Reports({ docs, catalog, trackingRecords, groupTrackingRecords }:{
 
 interface UserRow { id:number; name:string; email:string; role:"Admin"|"Staff"; office:string; status:"Active"|"Pending"|"Inactive"; lastLogin:string; contactNumber:string; }
 const ADMINISTRATIVE_OFFICE = "City Administrative Office";
-const DEFAULT_MANAGED_OFFICES = [
-  ADMINISTRATIVE_OFFICE,
-  "City Treasurer Office",
-  "City Budget Office",
-  "City Accounting Office",
-];
 
-function UserManagement() {
+function UserManagement({ officeOptions }:{ officeOptions:string[] }) {
   const C=useC();
   const [showForm,setShowForm]=useState(false);
   const [users,setUsers]=useState<UserRow[]>([]);
   const [usersLoaded,setUsersLoaded]=useState(false);
-  const [officeStaff,setOfficeStaff]=useState<OfficeStaffRow[]>([]);
-  const [selectedOffice,setSelectedOffice]=useState("");
+  const [selectedOffice,setSelectedOffice]=useState(ADMINISTRATIVE_OFFICE);
   const [form,setForm]=useState({
     firstName:"",
     lastName:"",
@@ -5049,28 +5891,31 @@ function UserManagement() {
   const [editingRole,setEditingRole]=useState<UserRow|null>(null);
   const [roleDraft,setRoleDraft]=useState<"Admin"|"Staff">("Staff");
   const [roleError,setRoleError]=useState("");
-  const [editingOfficeStaff,setEditingOfficeStaff]=useState<OfficeStaffRow|null>(null);
-  const [officeStaffDraft,setOfficeStaffDraft]=useState({fullName:"",contactNumber:"",office:"",status:"Active"});
-  const [officeStaffError,setOfficeStaffError]=useState("");
+  const userOfficeOptions=Array.from(new Set([
+    ADMINISTRATIVE_OFFICE,
+    ...officeOptions.filter(office=>office.trim()&&office.trim().toLowerCase()!==ADMINISTRATIVE_OFFICE.toLowerCase()&&
+      getTrackingOfficeIdentifier(office)!=="PRC"),
+  ]));
+  const formOffice=(preferred:string)=>userOfficeOptions.includes(preferred)?preferred:userOfficeOptions[0]??"";
+  const userOfficeLabels:Record<string,string>={[ADMINISTRATIVE_OFFICE]:ADMINISTRATIVE_OFFICE.toUpperCase()};
+  const availableOffices=Array.from(new Set([
+    ADMINISTRATIVE_OFFICE,
+    ...officeOptions.filter(office=>office.trim()&&office.trim().toLowerCase()!==ADMINISTRATIVE_OFFICE.toLowerCase()&&
+      getTrackingOfficeIdentifier(office)!=="PRC"),
+  ]));
 
   useEffect(()=>{
     if (!usersLoaded) return;
-    const availableOffices=Array.from(new Set([
-      ...DEFAULT_MANAGED_OFFICES,
-      ...users.map(user=>user.office),
-      ...officeStaff.map(member=>member.office),
-    ].filter(Boolean)));
     const preferred=availableOffices.includes(ADMINISTRATIVE_OFFICE)?ADMINISTRATIVE_OFFICE:availableOffices[0]??"";
     setSelectedOffice(current=>current&&availableOffices.includes(current)?current:preferred);
-    setForm(current=>current.office&&availableOffices.includes(current.office)?current:{...current,office:preferred});
-  },[users,officeStaff,usersLoaded]);
+    setForm(current=>current.office&&officeOptions.includes(current.office)?current:{...current,office:formOffice(preferred)});
+  },[usersLoaded,officeOptions]);
 
   const loadUsers=async ()=>{
     const response=await fetch('/api/users.php',{cache:'no-store'});
     const data=await response.json();
     if (!response.ok||!data.success) throw new Error(data.message||"Unable to load users.");
     setUsers(data.users||[]);
-    setOfficeStaff(data.officeStaff||[]);
     setUsersLoaded(true);
   };
 
@@ -5079,17 +5924,16 @@ function UserManagement() {
     setUsersLoaded(true);
   }); },[]);
 
-  const resetForm=()=>{
+  const resetForm=(office=selectedOffice)=>{
     setShowForm(false);
-    setForm({ firstName:"", lastName:"", email:"", role:"Staff", office:selectedOffice, password:"", confirmPassword:"", contactNumber:"" });
+    setForm({ firstName:"", lastName:"", email:"", role:"Staff", office:formOffice(office), password:"", confirmPassword:"", contactNumber:"" });
   };
-
-  const isAdministrativeOffice = form.office === ADMINISTRATIVE_OFFICE;
+  const isAdministrativeOffice = form.office.trim().toLowerCase() === ADMINISTRATIVE_OFFICE.toLowerCase();
 
   const validateContactNumber = (value:string) => {
     const digits = value.replace(/\D/g, '');
     if (!digits) return 'Contact number is required.';
-    if (!/^\d{11}$/.test(digits)) return 'Contact number must be exactly 11 digits only.';
+    if (!/^09\d{9}$/.test(digits)) return 'Contact number must start with 09 and contain exactly 11 digits.';
     return '';
   };
   const ss=(s:string)=>{
@@ -5099,40 +5943,6 @@ function UserManagement() {
   };
   const toggle=async (user:UserRow)=>{ const status=user.status==="Active"?"inactive":"active"; const res=await fetch('/api/users.php',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:user.id,status})}); if(res.ok) setUsers(us=>us.map(u=>u.id===user.id?{...u,status:status==='active'?"Active":"Inactive"}:u)); };
   const remove=async (id:number)=>{ const res=await fetch('/api/users.php',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); if(res.ok) setUsers(us=>us.filter(u=>u.id!==id)); };
-  const removeOfficeStaff=async (id:number)=>{
-    const response=await fetch('/api/users.php',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({contact_id:id})});
-    if(response.ok) setOfficeStaff(members=>members.filter(member=>member.id!==id));
-  };
-  const saveOfficeStaff=async()=>{
-    if (!editingOfficeStaff) return;
-    setOfficeStaffError("");
-    const fullName=officeStaffDraft.fullName.trim();
-    const contactNumber=officeStaffDraft.contactNumber.replace(/\D/g,"");
-    if (!fullName) { setOfficeStaffError("Name is required."); return; }
-    if (!/^\d{11}$/.test(contactNumber)) { setOfficeStaffError("Contact number must be exactly 11 digits only."); return; }
-    try {
-      const response=await fetch('/api/users.php',{
-        method:'PUT',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({
-          contact_id:editingOfficeStaff.id,
-          full_name:fullName,
-          contact_number:contactNumber,
-          office:officeStaffDraft.office,
-          status:officeStaffDraft.status.toLowerCase(),
-        }),
-      });
-      const data=await response.json().catch(()=>null);
-      if (!response.ok||!data?.success) {
-        setOfficeStaffError(data?.message||"Unable to update office staff details.");
-        return;
-      }
-      await loadUsers();
-      setEditingOfficeStaff(null);
-    } catch {
-      setOfficeStaffError("Unable to connect to the XAMPP database.");
-    }
-  };
   const saveRole=async()=>{
     if (!editingRole) return;
     setRoleError("");
@@ -5146,34 +5956,27 @@ function UserManagement() {
   const createUser=async ()=>{ setError("");
     const firstName=form.firstName.trim();
     const lastName=form.lastName.trim();
-    const office=form.office;
+    const office=isAdministrativeOffice?ADMINISTRATIVE_OFFICE:form.office.trim();
+    const email=form.email.trim().toLowerCase();
     const contactNumber=form.contactNumber.trim();
     const normalizedContactNumber = contactNumber.replace(/\D/g, '');
 
-    if (!office) { setError("Please select which office you are adding the user to."); return; }
+    if (!office) { setError("Please select an office from the Settings office list."); return; }
+    if (office.length>80) { setError("The selected office name must be 80 characters or fewer."); return; }
     if (!firstName || !lastName) { setError("First name and last name are required."); return; }
+    if (!email) { setError("Email is required for system access."); return; }
+    const phoneError = validateContactNumber(contactNumber);
+    if (phoneError) { setError(phoneError); return; }
+    if (!form.password || !form.confirmPassword) { setError("Password and confirm password are required."); return; }
+    if (form.password.length<4) { setError("Password must be at least 4 characters."); return; }
+    if (form.password !== form.confirmPassword) { setError("Passwords do not match."); return; }
 
-    if (isAdministrativeOffice) {
-      if (!form.email.trim()) { setError("Email is required for City Administrative Office users."); return; }
-      const adminPhoneError = validateContactNumber(contactNumber);
-      if (adminPhoneError) { setError(adminPhoneError); return; }
-      if (!form.password || !form.confirmPassword) { setError("Password and confirm password are required."); return; }
-      if (form.password !== form.confirmPassword) { setError("Passwords do not match."); return; }
-    } else {
-      const officePhoneError = validateContactNumber(contactNumber);
-      if (officePhoneError) { setError(officePhoneError); return; }
-    }
-
-    const payload = isAdministrativeOffice ? {
+    const payload = {
       full_name: `${firstName} ${lastName}`.trim(),
-      email: form.email.trim().toLowerCase(),
+      email,
       password: form.password,
       contact_number: normalizedContactNumber,
-      role: form.role.toLowerCase(),
-      office,
-    } : {
-      full_name: `${firstName} ${lastName}`.trim(),
-      contact_number: normalizedContactNumber,
+      role: isAdministrativeOffice ? form.role.toLowerCase() : "staff",
       office,
     };
 
@@ -5181,15 +5984,23 @@ function UserManagement() {
     const data=await res.json();
     if(!res.ok||!data.success){ setError(data.message||"Unable to create user."); return; }
     await loadUsers();
-    resetForm();
+    setSelectedOffice(office);
+    resetForm(office);
   };
   const visibleUsers=users.filter(u=>`${u.name} ${u.email} ${u.office}`.toLowerCase().includes(search.toLowerCase()));
-  const visibleOfficeStaff=officeStaff.filter(member=>member.office===selectedOffice&&`${member.fullName} ${member.contactNumber}`.toLowerCase().includes(search.toLowerCase()));
-  const availableOffices=Array.from(new Set([
-    ...DEFAULT_MANAGED_OFFICES,
-    ...users.map(user=>user.office),
-    ...officeStaff.map(member=>member.office),
-  ].filter(Boolean)));
+  const selectedOfficeUsers=visibleUsers.filter(user=>selectedOffice===ADMINISTRATIVE_OFFICE
+    ?user.office===ADMINISTRATIVE_OFFICE||user.role==="Admin"
+    :user.office===selectedOffice&&user.role!=="Admin");
+  const selectedOfficeUserCount=users.filter(user=>selectedOffice===ADMINISTRATIVE_OFFICE
+    ?user.office===ADMINISTRATIVE_OFFICE||user.role==="Admin"
+    :user.office===selectedOffice&&user.role!=="Admin").length;
+  const selectedOfficeRecordCount=selectedOfficeUserCount;
+  const officeUserCountLabels=Object.fromEntries(availableOffices.map(office=>[
+    office,
+    `${office} (${users.filter(user=>office===ADMINISTRATIVE_OFFICE
+      ?user.office===ADMINISTRATIVE_OFFICE||user.role==="Admin"
+      :user.office===office&&user.role!=="Admin").length})`,
+  ]));
 
   return (
     <div className="p-5">
@@ -5197,30 +6008,31 @@ function UserManagement() {
         <div>
           <h2 className="text-xl font-bold tracking-tight" style={{ color:C.text }}>User Management</h2>
           <p className="text-sm mt-0.5" style={{ color:C.muted }}>
-            Admin only · {selectedOffice===ADMINISTRATIVE_OFFICE?users.filter(user=>user.office===selectedOffice).length:officeStaff.filter(member=>member.office===selectedOffice).length} records
+            Admin only · {selectedOfficeRecordCount} records
           </p>
         </div>
-        <Btn size="large" onClick={()=>{
-          if (showForm) resetForm();
-          else { setForm(current=>({...current,office:selectedOffice})); setShowForm(true); }
-        }}>{showForm?"× Cancel":"+ Add New User"}</Btn>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Btn size="large" onClick={()=>{
+            if (showForm) resetForm();
+            else {
+              setError("");
+              setForm(current=>({...current,office:formOffice(selectedOffice)}));
+              setShowForm(true);
+            }
+          }}>{showForm?"× Cancel":"+ Add Office User"}</Btn>
+        </div>
       </div>
-      <div className="flex flex-wrap gap-2 mb-4" role="tablist" aria-label="Filter user records by office">
-        {availableOffices.map(office=>{
-          const count=office===ADMINISTRATIVE_OFFICE?users.filter(user=>user.office===office).length:officeStaff.filter(member=>member.office===office).length;
-          const active=selectedOffice===office;
-          return (
-            <button key={office} type="button" role="tab" aria-selected={active} onClick={()=>{
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="text-sm font-semibold" style={{ color:C.sub }} htmlFor="managed-office">Office</label>
+          <div className="w-full max-w-sm">
+            <TSelect size="large" options={availableOffices} optionLabels={officeUserCountLabels}
+              value={selectedOffice} onChange={office=>{
               setSelectedOffice(office);
-              if (showForm) setForm(current=>({...current,office}));
-            }}
-              className="rounded-lg px-4 py-2.5 text-sm font-semibold border"
-              style={{ borderColor:active?C.purple:C.border, color:active?C.purple:C.sub,
-                background:active?`${C.purple}18`:C.card }}>
-              {office} <span style={{ opacity:0.7 }}>({count})</span>
-            </button>
-          );
-        })}
+              if (showForm) setForm(current=>({...current,office:formOffice(office)}));
+            }}/>
+          </div>
+        </div>
       </div>
       {error&&<div className="rounded-xl px-4 py-2.5 mb-4 text-sm" style={{ background:`${C.red}18`, border:`1px solid ${C.red}33`, color:C.red }}>{error}</div>}
       {editingRole&&(
@@ -5235,52 +6047,28 @@ function UserManagement() {
           </div>
         </ModalOverlay>
       )}
-      {editingOfficeStaff&&(
-        <ModalOverlay onClose={()=>setEditingOfficeStaff(null)}>
-          <h3 className="text-lg font-bold mb-1" style={{ color:C.text }}>Edit Office Staff</h3>
-          <p className="text-sm mb-4" style={{ color:C.muted }}>Update this office contact's details.</p>
-          <div className="space-y-3">
-            <Field size="large" label="Full Name"><TInput size="large" value={officeStaffDraft.fullName} onChange={value=>setOfficeStaffDraft(current=>({...current,fullName:value}))}/></Field>
-            <Field size="large" label="Contact Number"><TInput size="large" value={officeStaffDraft.contactNumber} onChange={value=>setOfficeStaffDraft(current=>({...current,contactNumber:value}))} placeholder="09xx xxx xxxx"/></Field>
-            <Field size="large" label="Office"><TSelect size="large" options={availableOffices.filter(office=>office!==ADMINISTRATIVE_OFFICE)} value={officeStaffDraft.office} onChange={value=>setOfficeStaffDraft(current=>({...current,office:value}))}/></Field>
-            <Field size="large" label="Status"><TSelect size="large" options={["Active","Inactive"]} value={officeStaffDraft.status} onChange={value=>setOfficeStaffDraft(current=>({...current,status:value}))}/></Field>
-          </div>
-          {officeStaffError&&<p role="alert" className="text-sm mt-3" style={{ color:C.red }}>{officeStaffError}</p>}
-          <div className="flex justify-end gap-2 mt-5">
-            <Btn size="large" variant="ghost" onClick={()=>setEditingOfficeStaff(null)}>Cancel</Btn>
-            <Btn size="large" onClick={()=>void saveOfficeStaff()}>Save Details</Btn>
-          </div>
-        </ModalOverlay>
-      )}
       {showForm&&(
         <Card className="p-4 mb-4" style={{ border:`1px dashed ${C.purple}50` }}>
-          <p className="text-sm font-semibold uppercase tracking-wider mb-3" style={{ color:C.sub }}>Add New User</p>
+          <p className="text-sm font-semibold uppercase tracking-wider mb-3" style={{ color:C.sub }}>Add Office User</p>
           <div className="grid grid-cols-2 gap-3">
-            <Field size="large" label="Which office do you add?"><TSelect size="large" options={availableOffices} value={form.office} onChange={v=>setForm({...form,office:v})} placeholder="Select office"/></Field>
+            <Field size="large" label="Which office do you add?">
+              <TSelect size="large" options={userOfficeOptions} optionLabels={userOfficeLabels} value={form.office}
+                onChange={value=>setForm(current=>({
+                  ...current,
+                  office:value,
+                  role:value.trim().toLowerCase()===ADMINISTRATIVE_OFFICE.toLowerCase()?current.role:"Staff",
+                }))} placeholder={userOfficeOptions.length?"Select office":"No offices configured in Settings"}/>
+            </Field>
+            <Field size="large" label="First Name"><TInput size="large" value={form.firstName} onChange={v=>setForm({...form,firstName:v})} placeholder="Enter first name"/></Field>
+            <Field size="large" label="Last Name"><TInput size="large" value={form.lastName} onChange={v=>setForm({...form,lastName:v})} placeholder="Enter last name"/></Field>
+            <Field size="large" label="Email"><TInput size="large" type="email" value={form.email} onChange={v=>setForm({...form,email:v})} placeholder="user@city.gov.ph"/></Field>
+            <Field size="large" label="Contact Number"><TInput size="large" type="tel" inputMode="numeric" maxLength={11} value={form.contactNumber} onChange={v=>setForm({...form,contactNumber:normalizePhilippineContactInput(v)})} placeholder="09xx xxx xxxx"/></Field>
+            {isAdministrativeOffice&&<Field size="large" label="Role"><TSelect size="large" options={["Staff","Admin"]} value={form.role} onChange={v=>setForm({...form,role:v})} placeholder="Select role"/></Field>}
+            <Field size="large" label="Password"><TInput size="large" type="password" value={form.password} onChange={v=>setForm({...form,password:v})} placeholder="Create password"/></Field>
+            <Field size="large" label="Confirm Password"><TInput size="large" type="password" value={form.confirmPassword} onChange={v=>setForm({...form,confirmPassword:v})} placeholder="Confirm password"/></Field>
           </div>
-          {form.office && (
-            <div className="grid grid-cols-2 gap-3 mt-4">
-              {isAdministrativeOffice ? (
-                <>
-                  <Field size="large" label="First Name"><TInput size="large" value={form.firstName} onChange={v=>setForm({...form,firstName:v})} placeholder="Enter first name"/></Field>
-                  <Field size="large" label="Last Name"><TInput size="large" value={form.lastName} onChange={v=>setForm({...form,lastName:v})} placeholder="Enter last name"/></Field>
-                  <Field size="large" label="Email"><TInput size="large" type="email" value={form.email} onChange={v=>setForm({...form,email:v})} placeholder="user@city.gov.ph"/></Field>
-                  <Field size="large" label="Contact Number"><TInput size="large" value={form.contactNumber} onChange={v=>setForm({...form,contactNumber:v})} placeholder="09xx xxx xxxx"/></Field>
-                  <Field size="large" label="Role"><TSelect size="large" options={["Staff","Admin"]} value={form.role} onChange={v=>setForm({...form,role:v})} placeholder="Select role"/></Field>
-                  <Field size="large" label="Password"><TInput size="large" type="password" value={form.password} onChange={v=>setForm({...form,password:v})} placeholder="Create password"/></Field>
-                  <Field size="large" label="Confirm Password"><TInput size="large" type="password" value={form.confirmPassword} onChange={v=>setForm({...form,confirmPassword:v})} placeholder="Confirm password"/></Field>
-                </>
-              ) : (
-                <>
-                  <Field size="large" label="First Name"><TInput size="large" value={form.firstName} onChange={v=>setForm({...form,firstName:v})} placeholder="Enter first name"/></Field>
-                  <Field size="large" label="Last Name"><TInput size="large" value={form.lastName} onChange={v=>setForm({...form,lastName:v})} placeholder="Enter last name"/></Field>
-                  <Field size="large" label="Contact Number"><TInput size="large" value={form.contactNumber} onChange={v=>setForm({...form,contactNumber:v})} placeholder="09xx xxx xxxx"/></Field>
-                </>
-              )}
-            </div>
-          )}
           <div className="flex gap-3 mt-4 pt-3" style={{ borderTop:`1px solid ${C.border}` }}>
-            <Btn size="large" onClick={createUser}>✓ Create User</Btn>
+            <Btn size="large" disabled={!userOfficeOptions.length} onClick={createUser}>✓ Create Office User</Btn>
             <Btn size="large" variant="ghost" onClick={resetForm}>Cancel</Btn>
           </div>
         </Card>
@@ -5290,29 +6078,27 @@ function UserManagement() {
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search users…" className="rounded-lg px-3 py-2 text-sm border outline-none w-56"
             style={{ background:C.card2, borderColor:C.border, color:C.text }}/>
           <span className="text-sm ml-auto" style={{ color:C.muted }}>
-            {selectedOffice===ADMINISTRATIVE_OFFICE?visibleUsers.filter(user=>user.office===selectedOffice).length:visibleOfficeStaff.length} records
+            {selectedOfficeRecordCount} records
           </span>
         </div>
         <div className="overflow-x-auto">
         <table className="w-full min-w-[720px]">
           <thead>
             <tr style={{ borderBottom:`1px solid ${C.border}` }}>
-              {(selectedOffice===ADMINISTRATIVE_OFFICE
-                ?["Name","Email","Contact Number","Office","Role","Status","Last Login","Actions"]
-                :["Name","Contact Number","Office","Status","Actions"]).map(h=>(
+              {["Name","Email","Contact Number","Office","Role","Status","Last Login","Actions"].map(h=>(
                 <th key={h} className="text-left px-4 py-3 text-sm font-semibold" style={{ color:C.muted }}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {selectedOffice===ADMINISTRATIVE_OFFICE&&visibleUsers.filter(user=>user.office===selectedOffice).map(u=>{
+            {selectedOfficeUsers.map(u=>{
               const style=ss(u.status);
               return (
                 <tr key={u.id} className="hover:bg-black/5" style={{ borderBottom:`1px solid ${C.border}` }}>
                   <td className="px-4 py-3 text-sm font-semibold" style={{ color:C.text }}>{u.name}</td>
                   <td className="px-4 py-3 text-sm" style={{ color:C.muted }}>{u.email}</td>
                   <td className="px-4 py-3 text-sm" style={{ color:C.muted }}>{u.contactNumber||"—"}</td>
-                  <td className="px-4 py-3 text-sm" style={{ color:C.sub }}>{u.office||"—"}</td>
+                  <td className="px-4 py-3 text-sm" style={{ color:C.sub }}>{u.role==="Admin"?ADMINISTRATIVE_OFFICE:u.office||"—"}</td>
                   <td className="px-4 py-2.5">
                     <span className="text-sm px-2.5 py-1 rounded-full font-semibold"
                       style={{ color:u.role==="Admin"?C.purple:C.sub,
@@ -5325,9 +6111,9 @@ function UserManagement() {
                   <td className="px-4 py-3 text-sm" style={{ color:C.muted }}>{u.lastLogin}</td>
                   <td className="px-4 py-2.5">
                     <div className="flex gap-1.5">
-                      <button onClick={()=>{setEditingRole(u);setRoleDraft(u.role);setRoleError("");}}
+                      {u.office.trim().toLowerCase()===ADMINISTRATIVE_OFFICE.toLowerCase()&&<button onClick={()=>{setEditingRole(u);setRoleDraft(u.role);setRoleError("");}}
                         className="text-sm px-3 py-1.5 rounded border whitespace-nowrap"
-                        style={{ borderColor:C.border, color:C.sub }}>Edit Role</button>
+                        style={{ borderColor:C.border, color:C.sub }}>Edit Role</button>}
                       <button onClick={()=>toggle(u)} className="text-sm px-3 py-1.5 rounded border whitespace-nowrap"
                         style={{ borderColor:u.status==="Active"?"rgba(239,68,68,0.3)":"rgba(16,185,129,0.3)",
                           color:u.status==="Active"?C.red:C.green }}>
@@ -5341,34 +6127,8 @@ function UserManagement() {
                 </tr>
               );
             })}
-            {selectedOffice!==ADMINISTRATIVE_OFFICE&&visibleOfficeStaff.map(member=>{
-              const style=ss(member.status);
-              return (
-                <tr key={`office-staff-${member.id}`} className="hover:bg-black/5" style={{ borderBottom:`1px solid ${C.border}` }}>
-                  <td className="px-4 py-3 text-sm font-semibold" style={{ color:C.text }}>{member.fullName}</td>
-                  <td className="px-4 py-3 text-sm" style={{ color:C.muted }}>{member.contactNumber}</td>
-                  <td className="px-4 py-3 text-sm" style={{ color:C.sub }}>{member.office}</td>
-                  <td className="px-4 py-2.5">
-                    <span className="text-sm px-2.5 py-1 rounded-full font-semibold" style={{ color:style.color, background:style.bg }}>{member.status}</span>
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <div className="flex gap-1.5">
-                      <button onClick={()=>{
-                        setEditingOfficeStaff(member);
-                        setOfficeStaffDraft({fullName:member.fullName,contactNumber:member.contactNumber,office:member.office,status:member.status});
-                        setOfficeStaffError("");
-                      }} className="text-sm px-3 py-1.5 rounded border whitespace-nowrap"
-                        style={{ borderColor:C.border, color:C.sub }}>Edit</button>
-                      <button onClick={()=>void removeOfficeStaff(member.id)} className="text-sm px-3 py-1.5 rounded border whitespace-nowrap"
-                        style={{ borderColor:"rgba(239,68,68,0.2)", color:C.red }}>Remove</button>
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-            {((selectedOffice===ADMINISTRATIVE_OFFICE&&!visibleUsers.some(user=>user.office===selectedOffice))||
-              (selectedOffice!==ADMINISTRATIVE_OFFICE&&visibleOfficeStaff.length===0))&&(
-              <tr><td colSpan={selectedOffice===ADMINISTRATIVE_OFFICE?8:5} className="px-4 py-8 text-center text-sm" style={{ color:C.muted }}>No records found for this office.</td></tr>
+            {selectedOfficeUsers.length===0&&(
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-sm" style={{ color:C.muted }}>No records found for this office.</td></tr>
             )}
           </tbody>
         </table>
@@ -5627,7 +6387,7 @@ function Settings({ catalog, setCatalog, setDocs, loadError }:{
           {/* Note */}
           <div className="rounded-xl px-4 py-3 text-xs"
             style={{ background:`${C.blue}12`, border:`1px solid ${C.blue}30`, color:C.blue }}>
-            ℹ Changes apply immediately. Other screens (Edit modal, Reports, Office/Processor mini-systems) will be extended to full light-mode parity in development.
+            ℹ Changes apply immediately. Other screens (Edit modal, Reports, and processor lookup) will be extended to full light-mode parity in development.
           </div>
         </div>
       ) : (
@@ -5695,7 +6455,7 @@ function Profile({ user, setUser, onLogout }:{ user:AuthUser; setUser:(user:Auth
   const save=async()=>{
     setMessage("");
     const contactNumber=form.contactNumber.replace(/\D/g,"");
-    if (!/^\d{11}$/.test(contactNumber)) { setMessage("Contact number must be exactly 11 digits."); return; }
+    if (!/^09\d{9}$/.test(contactNumber)) { setMessage("Contact number must start with 09 and contain exactly 11 digits."); return; }
     const res=await fetch('/api/users.php',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:user.id,full_name:form.name,email:form.email,username:form.username,contact_number:contactNumber,current_password:form.currentPassword,new_password:form.newPassword})});
     const data=await res.json();
     if(!res.ok||!data.success){setMessage(data.message||"Unable to update profile.");return;}
@@ -5728,8 +6488,8 @@ function Profile({ user, setUser, onLogout }:{ user:AuthUser; setUser:(user:Auth
               <Field label="Full Name"><TInput value={form.name} readOnly={!editing} onChange={value=>setForm({...form,name:value})}/></Field>
               <Field label="Username"><TInput value={form.username} readOnly={!editing} onChange={value=>setForm({...form,username:value})}/></Field>
               <Field label="Email"><TInput type="email" value={form.email} readOnly={!editing} onChange={value=>setForm({...form,email:value})}/></Field>
-              <Field label="Contact Number"><TInput type="tel" value={form.contactNumber} readOnly={!editing}
-                onChange={value=>setForm({...form,contactNumber:value.replace(/\D/g,"").slice(0,11)})} placeholder="11-digit contact number"/></Field>
+              <Field label="Contact Number"><TInput type="tel" inputMode="numeric" maxLength={11} value={form.contactNumber} readOnly={!editing}
+                onChange={value=>setForm({...form,contactNumber:normalizePhilippineContactInput(value)})} placeholder="09xx xxx xxxx"/></Field>
               <Field label="Role"><TInput value={user.role==="admin"?"Admin":"Staff"} readOnly/></Field>
               <Field label="Office"><TInput value={user.office} readOnly/></Field>
             </div>
@@ -5762,81 +6522,15 @@ function Profile({ user, setUser, onLogout }:{ user:AuthUser; setUser:(user:Auth
 export function OfficePortalApp() {
   const mode=getOfficePortalMode();
   const initialControlNumber=new URLSearchParams(window.location.search).get("control")??undefined;
-  const [docs,setDocs]=useState<DocRecord[]>([]);
-  const [tracking,setTracking]=useState<TrackingRecord[]>([]);
-  const [groupTracking,setGroupTracking]=useState<GroupTrackingRecord[]>([]);
   const [theme,setTheme]=useState<Theme>("light");
-  const [refreshing,setRefreshing]=useState(false);
-  const [initialDataLoaded,setInitialDataLoaded]=useState(false);
 
   useEffect(()=>{
-    const context=mode==="processor"?"Processor":mode?MODE_OFFICE_NAME[mode]:"";
-    document.title=context?`ADTRAQS - ${context}`:"ADTRAQS";
+    document.title=mode==="processor"?"ADTRAQS - Document Location Lookup":"ADTRAQS";
   },[mode]);
-
-  const refreshData=async()=>{
-    setRefreshing(true);
-    try {
-      const [docsRes,trackingRes,groupsRes]=await Promise.all([
-        fetch('/api/docs.php',{cache:'no-store'}),
-        fetch('/api/tracking.php',{cache:'no-store'}),
-        fetch('/api/group-tracking.php',{cache:'no-store'}),
-      ]);
-      if (docsRes.ok) {
-        const data=await docsRes.json();
-        if (data.success) setDocs(data.docs??[]);
-      }
-      if (trackingRes.ok) {
-        const data=await trackingRes.json();
-        if (data.success) setTracking(data.tracking??[]);
-      }
-      if (groupsRes.ok) {
-        const data=await groupsRes.json();
-        if (data.success) setGroupTracking(data.groups??[]);
-      }
-    } catch(error) {
-      console.error('Failed to refresh office portal data',error);
-    } finally {
-      setRefreshing(false);
-    }
-  };
-
-  useEffect(()=>{
-    void refreshData().finally(()=>setInitialDataLoaded(true));
-  },[]);
-  useEffect(()=>{
-    const refreshTracking=async()=>{
-      try {
-        const [response,groupsResponse]=await Promise.all([
-          fetch('/api/tracking.php',{cache:'no-store'}),
-          fetch('/api/group-tracking.php',{cache:'no-store'}),
-        ]);
-        if (response.ok) {
-          const data=await response.json();
-          if (data.success) setTracking(data.tracking??[]);
-        }
-        if (groupsResponse.ok) {
-          const data=await groupsResponse.json();
-          if (data.success) setGroupTracking(data.groups??[]);
-        }
-      } catch(error) {
-        console.error('Failed to refresh tracking data',error);
-      }
-    };
-    const interval=window.setInterval(refreshTracking,2000);
-    return()=>window.clearInterval(interval);
-  },[]);
 
   if (mode==="processor") {
     return <ThemeCtx.Provider value={{theme,setTheme}}>
-      <ProcessorMiniSystem docs={docs} trackingRecords={tracking} groupTrackingRecords={groupTracking}
-        initialControlNumber={initialControlNumber} initialDataLoaded={initialDataLoaded}/>
-    </ThemeCtx.Provider>;
-  }
-  if (mode && (mode === "office-ct" || mode === "office-cb" || mode === "office-ca")) {
-    return <ThemeCtx.Provider value={{theme,setTheme}}>
-      <OfficeMiniSystem mode={mode} docs={docs} trackingRecords={tracking} groupTrackingRecords={groupTracking} setDocs={setDocs} setTrackingRecords={setTracking} setGroupTrackingRecords={setGroupTracking}
-        onRefresh={refreshData} refreshing={refreshing}/>
+      <ProcessorMiniSystem initialControlNumber={initialControlNumber}/>
     </ThemeCtx.Provider>;
   }
 
@@ -5846,7 +6540,7 @@ export function OfficePortalApp() {
         <GingoogSeal size={72}/>
         <h1 className="mt-4 text-lg font-bold" style={{color:theme==="dark"?"#fff":"#1A1D2B"}}>Use your assigned office link</h1>
         <p className="mt-2 text-sm" style={{color:theme==="dark"?"rgba(255,255,255,0.65)":"#5C6178"}}>
-          This page is for office and processor tracking links.
+          Sign in to the main system with your office account to view and route documents.
         </p>
       </AuthCard>
     </AuthBg>
@@ -5857,10 +6551,12 @@ export function OfficePortalApp() {
 
 export default function App() {
   const [savedSession]=useState(readSavedAppSession);
-  const [appState,setAppState]=useState<"login"|"signup"|"app">(savedSession?"app":"login");
+  const [appState,setAppState]=useState<"login"|"signup"|"app"|"checking">(savedSession?"checking":"login");
   const [role,setRole]        =useState<Role>(savedSession?.role??"admin");
   const [user,setUser]        =useState<AuthUser|null>(savedSession?.user??null);
+  const [sessionToken,setSessionToken]=useState(savedSession?.sessionToken??"");
   const [screen,setScreen]    =useState<AppScreen>(savedSession?.screen??"dashboard");
+  const [refreshing,setRefreshing]=useState(false);
   const [docs,setDocs]        =useState<DocRecord[]>([]);
   const [tracking,setTracking]=useState<TrackingRecord[]>([]);
   const [groupTracking,setGroupTracking]=useState<GroupTrackingRecord[]>([]);
@@ -5872,64 +6568,176 @@ export default function App() {
   const notifications=getTrackingNotifications(tracking);
 
   useEffect(()=>{
-    document.title="ADTRAQS";
+    document.title=user?.office?`ADTRAQS - ${user.office}`:"ADTRAQS";
   },[appState,role,user]);
 
   useEffect(()=>{
+    if (!user) return;
+    if (isCityAdminOffice(user.office)&&screen==="document-tracking") {
+      setScreen("dashboard");
+    } else if (!isCityAdminOffice(user.office)&&
+      (screen==="dashboard"||screen==="reports")) {
+      setScreen("document-tracker");
+    }
+  },[user?.office,screen]);
+
+  useEffect(()=>{
     if (appState==="app"&&user) {
-      saveAppSession({user,role,screen,theme});
+      saveAppSession({user,role,screen,theme,sessionToken});
     } else if (appState==="login") {
       clearSavedAppSession();
     }
-  },[appState,role,user,screen,theme]);
+  },[appState,role,user,screen,theme,sessionToken]);
 
-  const reloadApp=()=>{
-    if (appState==="app"&&user&&!saveAppSession({user,role,screen,theme})) {
-      alert("Unable to preserve your sign-in for refresh. Please check browser storage settings and try again.");
-      return;
+  useEffect(()=>{
+    if (!savedSession) return;
+    let cancelled=false;
+    apiFetch('/api/users.php',{cache:'no-store'})
+      .then(async response=>{
+        if (response.status===401||response.status===403) {
+          clearSavedAppSession();
+          setSessionToken("");
+          setUser(null);
+          setAppState("login");
+          return;
+        }
+        const data=await response.json();
+        if (!response.ok||!data.success) throw new Error(data.message||"Unable to validate the saved sign-in.");
+        const account=(data.users??[]).find((candidate:UserRow)=>candidate.id===savedSession.user.id);
+        if (!account||account.status.toLowerCase()!=="active") {
+          clearSavedAppSession();
+          setSessionToken("");
+          setUser(null);
+          setAppState("login");
+          return;
+        }
+        const accountRole=account.role.toLowerCase()==="admin"?"admin":"staff";
+        setRole(accountRole);
+        setUser({
+          ...savedSession.user,
+          fullName:account.name,
+          email:account.email,
+          role:accountRole,
+          office:account.office,
+          status:account.status,
+          contactNumber:account.contactNumber||"",
+        });
+        if (!isCityAdminOffice(account.office)&&
+          (savedSession.screen==="dashboard"||savedSession.screen==="reports")) {
+          setScreen("document-tracker");
+        }
+        setAppState("app");
+      })
+      .catch(error=>{
+        if (cancelled) return;
+        console.error("Unable to validate the saved sign-in.",error);
+        setAppState("app");
+        alert("Unable to verify your saved sign-in with the server. Your saved sign-in was kept; check your connection and try refreshing again.");
+      });
+    return()=>{cancelled=true;};
+  },[savedSession]);
+
+  const refreshAppData=async()=>{
+    setRefreshing(true);
+    try {
+      if (!sessionToken) {
+        throw new Error("Your sign-in session is unavailable. Please sign in again.");
+      }
+      const headers={"X-ADTRAQS-SESSION":sessionToken};
+      const [docsResponse,trackingResponse,catalogData]=await Promise.all([
+        apiFetch('/api/docs', { cache:'no-store', headers }),
+        apiFetch('/api/tracking', { cache:'no-store', headers }),
+        loadCatalog(),
+      ]);
+      const [docsResult,trackingResult]=await Promise.all([
+        docsResponse.json(),
+        trackingResponse.json(),
+      ]);
+      if (!docsResponse.ok||!docsResult.success) {
+        throw new Error(docsResult.message||`Unable to refresh documents (${docsResponse.status}).`);
+      }
+      if (!trackingResponse.ok||!trackingResult.success) {
+        throw new Error(trackingResult.message||`Unable to refresh tracking (${trackingResponse.status}).`);
+      }
+      setDocs(docsResult.docs??[]);
+      setTracking(trackingResult.tracking??[]);
+      setGroupTracking([]);
+      setCatalog(catalogData);
+      setCatalogLoadError("");
+    } catch (error) {
+      console.error("Failed to refresh app data.",error);
+      alert(error instanceof Error?error.message:"Unable to refresh app data.");
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleReload=()=>{
+    if (user&&sessionToken) {
+      saveAppSession({user,role,screen,theme,sessionToken});
     }
     window.location.reload();
   };
 
+  const handleLogout=async()=>{
+    try {
+      const response=await apiFetch('/api/auth/logout',{method:'POST'});
+      if (!response.ok) throw new Error(`Logout failed (${response.status}).`);
+      clearSavedAppSession();
+      setSessionToken("");
+      setUser(null);
+      setAppState("login");
+      setScreen("dashboard");
+    } catch (error) {
+      console.error("Logout failed",error);
+      alert("Unable to sign out from the server. Please try again.");
+    }
+  };
+
   useEffect(() => {
+    if (appState!=="app"||!user) {
+      setDocs([]);
+      setTracking([]);
+      setGroupTracking([]);
+      return;
+    }
+
+    let cancelled=false;
     async function loadData() {
       try {
-        const [docsRes, trackingRes, groupsRes] = await Promise.all([
+        const [docsRes, trackingRes] = await Promise.all([
           apiFetch('/api/docs', { cache:'no-store' }),
           apiFetch('/api/tracking', { cache:'no-store' }),
-          apiFetch('/api/group-tracking.php', { cache:'no-store' }),
         ]);
 
         if (docsRes.ok) {
           const docsData = await docsRes.json();
-          setDocs(docsData.docs ?? []);
+          if (!cancelled) setDocs(docsData.docs ?? []);
         } else {
-          setDocs([]);
+          if (!cancelled) setDocs([]);
         }
 
         if (trackingRes.ok) {
           const trackingData = await trackingRes.json();
-          setTracking(trackingData.tracking ?? []);
+          if (!cancelled) setTracking(trackingData.tracking ?? []);
         } else {
-          setTracking([]);
+          if (!cancelled) setTracking([]);
         }
 
-        if (groupsRes.ok) {
-          const groupsData = await groupsRes.json();
-          setGroupTracking(groupsData.groups ?? []);
-        } else {
-          setGroupTracking([]);
-        }
+        if (!cancelled) setGroupTracking([]);
       } catch (error) {
         console.error('Failed to load app data', error);
-        setDocs([]);
-        setTracking([]);
-        setGroupTracking([]);
+        if (!cancelled) {
+          setDocs([]);
+          setTracking([]);
+          setGroupTracking([]);
+        }
       }
     }
 
-    loadData();
-  }, []);
+    void loadData();
+    return ()=>{ cancelled=true; };
+  }, [appState,user?.id]);
 
   useEffect(() => {
     loadCatalog()
@@ -5941,20 +6749,27 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!user) {
+      setTracking([]);
+      setGroupTracking([]);
+      return;
+    }
+    let cancelled=false;
     const refreshTracking=async()=>{
       try {
-        const [response,groupsResponse]=await Promise.all([
+        const [docsResponse,response]=await Promise.all([
+          apiFetch('/api/docs', { cache:'no-store' }),
           apiFetch('/api/tracking', { cache:'no-store' }),
-          apiFetch('/api/group-tracking.php', { cache:'no-store' }),
         ]);
+        if (docsResponse.ok) {
+          const data=await docsResponse.json();
+          if (!cancelled&&data.success !== false) setDocs(data.docs ?? []);
+        }
         if (response.ok) {
           const data=await response.json();
-          if (data.success !== false) setTracking(data.tracking ?? []);
+          if (!cancelled&&data.success !== false) setTracking(data.tracking ?? []);
         }
-        if (groupsResponse.ok) {
-          const data=await groupsResponse.json();
-          if (data.success !== false) setGroupTracking(data.groups ?? []);
-        }
+        if (!cancelled) setGroupTracking([]);
       } catch (error) {
         console.error('Failed to refresh tracking data', error);
       }
@@ -5962,8 +6777,8 @@ export default function App() {
     const interval=window.setInterval(refreshTracking,2000);
     const onFocus=()=>void refreshTracking();
     window.addEventListener('focus',onFocus);
-    return()=>{ window.clearInterval(interval); window.removeEventListener('focus',onFocus); };
-  }, []);
+    return()=>{ cancelled=true; window.clearInterval(interval); window.removeEventListener('focus',onFocus); };
+  }, [user?.id]);
 
   if (appState==="login") return (
     <ThemeCtx.Provider value={{ theme, setTheme }}>
@@ -5983,11 +6798,17 @@ export default function App() {
             }
 
             const userRecord = result.user ?? {};
+            if (typeof result.session_token!=="string"||result.session_token.length===0) {
+              alert("The server did not create an isolated sign-in session. Please update the backend and try again.");
+              return;
+            }
+            setSessionToken(result.session_token);
             setRole(userRecord.role === 'admin' ? 'admin' : 'staff');
             const contactNumber=String(userRecord.contact_number??userRecord.contactNumber??'').replace(/\D/g,'');
-            setUser({id:userRecord.id,fullName:userRecord.full_name ?? userRecord.fullName ?? 'User',email:userRecord.email,username:userRecord.username ?? '',role:userRecord.role === 'admin' ? 'admin' : 'staff',office:userRecord.office ?? 'CHO',status:userRecord.status ?? 'Active',position:userRecord.position ?? '',contactNumber});
+            const office=userRecord.office??'CHO';
+            setUser({id:userRecord.id,fullName:userRecord.full_name ?? userRecord.fullName ?? 'User',email:userRecord.email,username:userRecord.username ?? '',role:userRecord.role === 'admin' ? 'admin' : 'staff',office,status:userRecord.status ?? 'Active',position:userRecord.position ?? '',contactNumber});
             setAppState('app');
-            setScreen('dashboard');
+            setScreen(isCityAdminOffice(office)?'dashboard':'document-tracker');
           } catch (error) {
             console.error('Login failed', error);
             alert('Unable to connect to the backend server.');
@@ -5999,26 +6820,38 @@ export default function App() {
 
   if (appState==="signup") return (
     <ThemeCtx.Provider value={{ theme, setTheme }}>
-      <SignUpScreen onBack={()=>setAppState("login")} offices={catalog.offices}/>
+      <SignUpScreen onBack={()=>setAppState("login")}
+        offices={catalog.offices.filter(office=>getTrackingOfficeIdentifier(office)!=="PRC")}/>
+    </ThemeCtx.Provider>
+  );
+
+  if (appState==="checking") return (
+    <ThemeCtx.Provider value={{ theme, setTheme }}>
+      <div className="min-h-screen flex items-center justify-center" style={{ background:DARK_C.bg, color:DARK_C.text }}>
+        Checking your sign-in…
+      </div>
     </ThemeCtx.Provider>
   );
 
   return (
     <ThemeCtx.Provider value={{ theme, setTheme }}>
       <AppShell screen={screen} setScreen={setScreen} role={role} user={user}
-        onRefresh={reloadApp} refreshing={false} notifications={notifications}
-        onLogout={()=>{ clearSavedAppSession(); setUser(null); setAppState("login"); setScreen("dashboard"); }}>
+        onReload={handleReload} notifications={notifications}
+        onOpenNotification={id=>{ setTrackingToView(id); setScreen("document-tracker"); }}
+        onLogout={handleLogout}>
         {screen==="dashboard"            &&user&&        <Dashboard role={role} setScreen={setScreen} docs={docs} trackingRecords={tracking} groupTrackingRecords={groupTracking} user={user} catalog={catalog}/>}
         {screen==="document-tracker"     &&<DocumentTracker role={role} user={user} docs={docs} trackingRecords={tracking} groupTrackingRecords={groupTracking} catalog={catalog} setDocs={setDocs} setTracking={setTracking} setGroupTrackingRecords={setGroupTracking}
           openDocumentId={documentToView??undefined} onOpenDocumentHandled={()=>setDocumentToView(null)}
+          openTrackingId={trackingToView??undefined} onOpenTrackingHandled={()=>setTrackingToView(null)}
           onViewTracking={id=>{ setDocumentToView(null); setTrackingToView(id); setScreen("tracking-monitoring"); }}/ >}
-        {screen==="tracking-monitoring"  &&<TrackingMonitoring trackingRecords={tracking} setTrackingRecords={setTracking} groupTrackingRecords={groupTracking} setGroupTrackingRecords={setGroupTracking} docs={docs} setDocs={setDocs} role={role} user={user}
+        {screen==="document-tracking"      &&<DocumentTracking trackingRecords={tracking} setTrackingRecords={setTracking} user={user} catalog={catalog} role={role}/>}
+        {screen==="tracking-monitoring"  &&<TrackingMonitoring trackingRecords={tracking} setTrackingRecords={setTracking} groupTrackingRecords={groupTracking} setGroupTrackingRecords={setGroupTracking} docs={docs} setDocs={setDocs} role={role} user={user} catalog={catalog}
           onViewDocument={id=>{ setDocumentToView(id); setScreen("document-tracker"); }} initialTrackingId={trackingToView??undefined}
           onInitialTrackingHandled={()=>setTrackingToView(null)}/ >}
         {screen==="reports"              &&<Reports docs={docs} catalog={catalog} trackingRecords={tracking} groupTrackingRecords={groupTracking}/>}
-        {screen==="user-management"     &&<UserManagement/>}
+        {screen==="user-management"     &&<UserManagement officeOptions={catalog.offices}/>}
         {screen==="settings"             &&<Settings catalog={catalog} setCatalog={setCatalog} setDocs={setDocs} loadError={catalogLoadError}/>}
-        {screen==="profile"              &&user&&<Profile user={user} setUser={setUser} onLogout={()=>{ clearSavedAppSession(); setUser(null); setAppState("login"); setScreen("dashboard"); }}/>}
+        {screen==="profile"              &&user&&<Profile user={user} setUser={setUser} onLogout={handleLogout}/>}
       </AppShell>
     </ThemeCtx.Provider>
   );

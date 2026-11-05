@@ -35,6 +35,7 @@ async function ensurePostgresSchema(pool) {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'staff',
       office TEXT,
+      contact_number TEXT,
       status TEXT NOT NULL DEFAULT 'Active',
       last_login TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -92,6 +93,7 @@ async function ensurePostgresSchema(pool) {
       flagged INTEGER NOT NULL DEFAULT 0
     );
   `);
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS contact_number TEXT');
 
 
 }
@@ -115,6 +117,7 @@ export function initializeDatabase(dbPath = DEFAULT_DB_PATH) {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'staff',
       office TEXT,
+      contact_number TEXT,
       status TEXT NOT NULL DEFAULT 'Active',
       last_login TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -173,7 +176,10 @@ export function initializeDatabase(dbPath = DEFAULT_DB_PATH) {
     );
   `);
 
-
+  const userColumns = db.prepare('PRAGMA table_info(users)').all();
+  if (!userColumns.some((column) => column.name === 'contact_number')) {
+    db.exec('ALTER TABLE users ADD COLUMN contact_number TEXT');
+  }
 
   return { kind: 'sqlite', db, ready: Promise.resolve(), close: () => db.close() };
 }
@@ -272,17 +278,17 @@ export function createUser(db, payload) {
   if (db.kind === 'postgres') {
     return db.ready.then(async () => {
       const result = await db.pool.query(
-        'INSERT INTO users (full_name, email, password_hash, role, office, status, last_login) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, full_name AS "fullName", email, role, office, status, last_login AS "lastLogin"',
-        [payload.fullName, payload.email, payload.passwordHash, payload.role, payload.office || 'CHO', payload.status || 'Active', payload.lastLogin || null]
+        'INSERT INTO users (full_name, email, password_hash, role, office, contact_number, status, last_login) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, full_name AS "fullName", email, role, office, contact_number AS "contactNumber", status, last_login AS "lastLogin"',
+        [payload.fullName, payload.email, payload.passwordHash, payload.role, payload.office || 'CHO', payload.contactNumber || null, payload.status || 'Active', payload.lastLogin || null]
       );
       const row = result.rows[0];
-      return { id: row.id, fullName: row.fullName, email: row.email, role: row.role, office: row.office, status: row.status, lastLogin: row.lastLogin };
+      return { id: row.id, fullName: row.fullName, email: row.email, role: row.role, office: row.office, contactNumber: row.contactNumber || '', status: row.status, lastLogin: row.lastLogin };
     });
   }
 
   const stmt = db.db.prepare(`
-    INSERT INTO users (full_name, email, password_hash, role, office, status, last_login)
-    VALUES (@fullName, @email, @passwordHash, @role, @office, @status, @lastLogin)
+    INSERT INTO users (full_name, email, password_hash, role, office, contact_number, status, last_login)
+    VALUES (@fullName, @email, @passwordHash, @role, @office, @contactNumber, @status, @lastLogin)
   `);
 
   const row = stmt.run({
@@ -291,6 +297,7 @@ export function createUser(db, payload) {
     passwordHash: payload.passwordHash,
     role: payload.role,
     office: payload.office || 'CHO',
+    contactNumber: payload.contactNumber || null,
     status: payload.status || 'Active',
     lastLogin: payload.lastLogin || null,
   });
@@ -301,6 +308,7 @@ export function createUser(db, payload) {
     email: payload.email,
     role: payload.role,
     office: payload.office || 'CHO',
+    contactNumber: payload.contactNumber || '',
     status: payload.status || 'Active',
     lastLogin: payload.lastLogin || null,
   };

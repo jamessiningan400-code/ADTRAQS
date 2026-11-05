@@ -10,26 +10,25 @@ The live site is a demonstration deployment. Do not enter real personal, financi
 
 - Registers and manages documents, including their control numbers and details.
 - Records document status and movement through office handoffs.
+- Provides an account-based Document Tracking page where staff open routed documents to confirm receipt, mark them for signature, and forward them.
 - Supports tracking views, tracking history, and QR-based lookup.
 - Provides dashboard and monitoring views for document activity.
-- Includes grouped-document tracking workflows.
-- Provides administrator, office, and processor modes.
+- Shows the weekly average processing time for each active office in the office settings list, with a vertical bottleneck chart that refreshes by calendar week.
+- Provides a read-only processor location lookup by QR code or control number.
+- Provides administrator and signed-in office accounts in the main application.
 - Supports user management and office assignment.
 
-The application includes these office modes:
+The standalone interface is retained only for processor lookups:
 
 | Area | Mode URL |
 | --- | --- |
-| City Treasurer Office | `office.html?mode=office-ct` |
-| City Budget Office | `office.html?mode=office-cb` |
-| City Accounting Office | `office.html?mode=office-ca` |
 | Processor | `office.html?mode=processor` |
 
-Office contact records and login accounts are separate. Adding an office contact does not automatically create an account that can sign in.
+Office accounts sign in through the main application. Other-office accounts use Document Tracking to process documents currently routed to them; forwarded documents leave that office's inbox. Their Tracking Monitoring shows records created by their office, including later routing history. City Administrative Office keeps its existing Tracking Monitoring behavior and does not use the Document Tracking page. Documents may be forwarded to any active office in the office list. City Administrative Office accounts share entries across City Admin office-name variants. City Administrative Office entries keep the global control number; other offices see an office-local entry count starting at 1. The processor lookup displays only the scanned document's current location and status. Document-set workflows, office staff records, and processor accounts are no longer used.
 
 ## Workflow overview
 
-The central workflow starts with document registration in the City Administrative Office, then follows the relevant partner-office handoffs. The system records status and tracking events as documents move between offices. Forwarding and receiving are distinct steps; a forwarded document is not necessarily recorded as received until the receiving office processes the handoff. Processors use the processor mode to access tracking functions available to their account.
+The central workflow starts with document registration in the City Administrative Office, then follows the relevant partner-office handoffs. The system records status and tracking events as documents move between offices. Forwarding and receiving are distinct steps; a forwarded document is not necessarily recorded as received until the receiving office processes the handoff. Processors can scan a document QR code and view its current location and status without routing or editing it.
 
 ## Technology and architecture
 
@@ -65,7 +64,7 @@ The generated site is written to `dist/`.
 
 1. Create a MySQL database and a PHP/Apache web space.
 2. Import `smartdocs-php/schema/smartdocs_mysql.sql` into that database. If the host has already created the database, remove the `CREATE DATABASE` and `USE adtraqs;` statements from a local copy before importing.
-3. Import `smartdocs-php/schema/document_groups_mysql.sql` into the same database. If needed, remove its `USE adtraqs;` statement from a local copy.
+3. For an existing installation, back up the database and run `smartdocs-php/schema/remove_legacy_routing_mysql.sql` once. This deletes document-set tracking, office staff, and processor records, and removes the processor columns from `documents`. Do not run this migration on a fresh database created from the updated schema.
 4. Copy `smartdocs-php/config/database.local.php.example` to `smartdocs-php/config/database.local.php` and enter the database host, database name, username, and password provided by your host. Keep this private configuration file out of Git and never publish its password.
 5. Build the frontend with `npm install` and `npm run build`.
 6. Upload the **contents** of `dist/` to the site's web root, including the hidden `.htaccess` file. Upload the **contents** of `smartdocs-php/` to a `smartdocs/` directory inside that same web root.
